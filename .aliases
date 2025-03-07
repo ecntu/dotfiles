@@ -5,6 +5,13 @@ alias d='cd ~/Documents'
 alias jn='jupyter notebook'
 alias jr='jupyter nbconvert --execute --to notebook --inplace --allow-errors'
 
+# Python
+alias act='source ./venv/bin/activate'
+alias nvenv='python3 -m venv venv'
+
+# Quick torch
+alias torch='python3 -i -c "import torch"'
+
 # System
 alias tuto='sudo shutdown -h now'
 
