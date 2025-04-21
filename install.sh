@@ -7,6 +7,7 @@ git pull origin main;
 function doIt() {
 	rsync --exclude ".git/" \
 		--exclude "bin/" \
+		--exclude "configs/" \
 		--exclude ".DS_Store" \
 		--exclude ".osx" \
 		--exclude "install.sh" \
