@@ -1,6 +1,14 @@
 # Navigation
 alias d='cd ~/Documents'
 
+# Random
+alias dfh="df -h"
+alias mkdirp="mkdir -p"
+
+alias count="ls -1 | wc -l"			        # no. of things
+alias countf="ls -p | grep -v / | wc -l"	# no. of files
+alias countd="ls -p | grep / | wc -l"		# no. of directories
+
 # Jupyter
 alias jn='jupyter notebook'
 alias jr='jupyter nbconvert --execute --to notebook --inplace --allow-errors'

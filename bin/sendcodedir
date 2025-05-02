@@ -1,0 +1,72 @@
+#!/bin/bash
+
+# This script uses rsync to send a local directory to a remote server.
+# It expects the remote server address as the first argument and
+# the local directory path as the second argument.
+# It will create a subdirectory in the remote user's Documents directory
+# with the same name as the local directory.
+# It automatically excludes .DS_Store files and uses a .gitignore file
+# in the local directory if one exists.
+
+# --- Configuration ---
+REMOTE_BASE_PATH="~/Documents" # The base path on the remote server
+
+# --- Script Logic ---
+
+# Check if the correct number of arguments are provided
+if [ "$#" -ne 2 ]; then
+    echo "Usage: $0 <remote_server_address> <local_directory_path>"
+    echo "Example: $0 user@your_server.com /path/to/my/project"
+    exit 1
+fi
+
+# Arguments are now expected in this order:
+REMOTE_SERVER="$1"
+LOCAL_DIR="$2"
+
+# Check if the local directory exists and is a directory
+if [ ! -d "$LOCAL_DIR" ]; then
+    echo "Error: Local directory '$LOCAL_DIR' not found or is not a directory."
+    exit 1
+fi
+
+# Get the base name of the local directory to use on the remote server
+DIR_NAME=$(basename "$LOCAL_DIR")
+REMOTE_DEST="$REMOTE_SERVER:$REMOTE_BASE_PATH/$DIR_NAME"
+
+# Start building the rsync command
+# -a: archive mode (preserves permissions, timestamps, etc.)
+# -z: compress file data during the transfer
+# -v: increase verbosity (optional, remove if you want less output)
+RSYNC_CMD="rsync -azv"
+
+# Check for a .gitignore file in the local directory and add exclusion if found
+if [ -f "$LOCAL_DIR/.gitignore" ]; then
+    RSYNC_CMD="$RSYNC_CMD --exclude-from \"$LOCAL_DIR/.gitignore\""
+    echo "Note: Using .gitignore from '$LOCAL_DIR' for exclusions."
+fi
+
+# Always exclude .DS_Store files
+RSYNC_CMD="$RSYNC_CMD --exclude '.DS_Store'"
+
+# Add the source and destination paths to the command
+# The trailing slash on the source directory ($LOCAL_DIR/) is crucial.
+# It tells rsync to copy the *contents* of the directory, not the directory itself,
+# into the destination directory ($REMOTE_BASE_PATH/$DIR_NAME).
+RSYNC_CMD="$RSYNC_CMD \"$LOCAL_DIR/\" \"$REMOTE_DEST\""
+
+# --- Execution ---
+
+echo "Syncing '$LOCAL_DIR/' to '$REMOTE_DEST'..."
+# Use eval to correctly handle spaces and quotes in the command string
+eval $RSYNC_CMD
+
+# Check the exit status of the rsync command
+if [ $? -eq 0 ]; then
+    echo "Rsync completed successfully."
+else
+    echo "Rsync failed. Please check the output above for errors."
+    exit 1
+fi
+
+exit 0
