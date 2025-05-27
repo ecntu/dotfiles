@@ -2,8 +2,10 @@
 alias d='cd ~/Documents'
 
 # Random
-alias dfh="df -h"
-alias mkdirp="mkdir -p"
+alias vim="nvim"
+alias v="vim"
+alias df="df -h"
+alias mkdir="mkdir -p"
 
 alias count="ls -1 | wc -l"			        # no. of things
 alias countf="ls -p | grep -v / | wc -l"	# no. of files
