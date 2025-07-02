@@ -2,7 +2,7 @@
 alias d='cd ~/Documents'
 
 # Random
-alias vim="nvim"
+# alias vim="nvim"
 alias v="vim"
 alias df="df -h"
 alias mkdir="mkdir -p"
