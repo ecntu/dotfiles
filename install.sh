@@ -13,6 +13,7 @@ function doIt() {
 		--exclude "install.sh" \
 		--exclude "README.md" \
 		-avh --no-perms . ~;
+	cp configs/.tmux.conf ~;
 	source ~/.bash_profile;
 }
 
