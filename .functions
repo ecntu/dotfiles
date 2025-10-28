@@ -30,6 +30,7 @@ function rssh() {
 		printf "  IdentityFile %s\n" "$ident"
 		printf "  IdentitiesOnly yes\n"
 		printf "  UserKnownHostsFile %s\n" "$RSSH_KNOWN"
+		printf "  ForwardAgent yes\n"
 	} >> "$RSSH_CONFIG"
 	echo "Added host '$alias' to $RSSH_CONFIG"
 	fi
