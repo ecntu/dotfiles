@@ -35,7 +35,7 @@ function rssh() {
 	echo "Added host '$alias' to $RSSH_CONFIG"
 	fi
 
-	exec ssh "$alias"
+	ssh "$alias"
 }
 
 function clean-rssh() {
