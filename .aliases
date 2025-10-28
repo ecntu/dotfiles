@@ -1,9 +1,6 @@
 # Navigation
 alias d='cd ~/Documents'
 
-# SSH
-alias rssh='ssh -F ~/.ssh/rented/config'
-
 # Random
 alias v="vim"
 alias df="df -h"
