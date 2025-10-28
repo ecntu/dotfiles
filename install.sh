@@ -8,6 +8,8 @@ function doIt() {
 	rsync --exclude ".git/" \
 		--exclude "bin/" \
 		--exclude "configs/" \
+		--exclude "raycast/" \
+		--exclude ".gitignore" \
 		--exclude ".DS_Store" \
 		--exclude ".osx" \
 		--exclude "install.sh" \
