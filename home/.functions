@@ -59,6 +59,3 @@ function clean-rssh() {
 	echo "Nothing to clean."
   fi
 }
-
-
-

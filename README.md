@@ -1,7 +1,7 @@
 # Personal dotfiles
 
-Install with
+Install GNU `stow` and run:
+
 ```bash
-git clone https://github.com/ecntu/dotfiles.git && cd dotfiles && bash install.sh;
+git clone https://github.com/ecntu/dotfiles.git ~/dotfiles && stow -d ~/dotfiles home
 ```
-Borrowed from [this repo](https://github.com/mathiasbynens/dotfiles/).
