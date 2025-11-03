@@ -1,5 +1,6 @@
 # Exports
 export TERM='xterm-256color'
+export XDG_CONFIG_HOME="$HOME/.config"
 export EDITOR='vim'
 export GOPATH=$HOME/go
 
