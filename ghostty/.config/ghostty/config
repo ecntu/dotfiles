@@ -1,0 +1,5 @@
+confirm-close-surface = false
+window-save-state = always
+clipboard-write = allow
+clipboard-paste-protection = false
+theme = Dark+
