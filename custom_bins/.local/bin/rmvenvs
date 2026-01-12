@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Removes venv directories ONLY in projects containing a uv.lock file
+# Prints each venv size and total reclaimed space at the end.
+
+set -euo pipefail
+
+ROOT="${1:-.}"
+
+echo "🔍 Searching for venvs to remove under: $ROOT"
+echo
+
+total_bytes=0
+
+# Find all uv.lock files
+find "$ROOT" -type f -name "uv.lock" | while read -r lockfile; do
+    project_dir="$(dirname "$lockfile")"
+    venv_path="$project_dir/.venv"
+
+    if [ -d "$venv_path" ]; then
+        # Get size in bytes
+        size_bytes=$(du -sb "$venv_path" | awk '{print $1}')
+        size_gb=$(awk "BEGIN {printf \"%.2f\", $size_bytes/1024/1024/1024}")
+
+        echo "📁 Found: $venv_path"
+        echo "   Size: ${size_gb} GB"
+
+        # Add to total and delete
+        total_bytes=$((total_bytes + size_bytes))
+        rm -rf "$venv_path"
+
+        echo "   ✅ Removed."
+        echo
+    fi
+done
+
+# Print total reclaimed
+total_gb=$(awk "BEGIN {printf \"%.2f\", $total_bytes/1024/1024/1024}")
+
+echo "💾 Total space reclaimed: ${total_gb} GB"

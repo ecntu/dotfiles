@@ -10,7 +10,7 @@ bindkey '^f' fzf-cd-widget
 FZF_DIR_ROOTS=(
     .
     "$HOME"
-    "$HOME/Documents" "$HOME/Documents/playgrounds"
+    "$HOME/Documents" "$HOME/Documents/playgrounds" "$HOME/Desktop"
 )
 export FZF_ALT_C_COMMAND="find ${(@q)FZF_DIR_ROOTS} -type d -maxdepth 1 -mindepth 1"
 

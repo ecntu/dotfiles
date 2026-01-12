@@ -10,6 +10,8 @@ alias count="ls -1 | wc -l"			        # no. of things
 alias countf="ls -p | grep -v / | wc -l"	# no. of files
 alias countd="ls -p | grep / | wc -l"		# no. of directories
 
+alias dirsize="du -sh * | sort -h"
+
 alias fpid="ps aux | fzf -m | awk '{print \$2}'" # find pid
 
 
