@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
 
+# Rsync but ignore .git and respect .gitignore.
+rsyncg() {
+  rsync -av --exclude='.git/' --filter=':- .gitignore' "$@"
+}
+
+
 
 # Rented SSH
 
