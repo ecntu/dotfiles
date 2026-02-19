@@ -7,7 +7,7 @@ set -euo pipefail
 TARGET="${TARGET:-$HOME}"
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-STOW_FOLDERS=("home" "vim" "tmux" "ghostty" "custom_bins")
+STOW_FOLDERS=("home" "vim" "tmux" "custom_bins")
 
 if ! command -v stow >/dev/null 2>&1; then
   echo "Error: GNU stow not found. Please install it and re-run." >&2
