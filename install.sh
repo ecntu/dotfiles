@@ -34,4 +34,15 @@ for folder in "${STOW_FOLDERS[@]}"; do
   stow -vt "$TARGET" "$folder"
 done
 
+# Ensure ~/.ssh/config includes boxes config
+SSH_CONFIG="$TARGET/.ssh/config"
+BOXES_INCLUDE="Include ~/.ssh/boxes/config"
+mkdir -p "$TARGET/.ssh/boxes"
+touch "$SSH_CONFIG"
+if ! grep -qF "$BOXES_INCLUDE" "$SSH_CONFIG"; then
+  # Include must be at the top of ssh config
+  printf '%s\n\n%s' "$BOXES_INCLUDE" "$(cat "$SSH_CONFIG")" > "$SSH_CONFIG"
+  echo "Added boxes Include to $SSH_CONFIG"
+fi
+
 echo "Done."

@@ -1,0 +1,192 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# boxes — basically convinient `ssh` and `rsync` wrappers for rented machines
+#
+# Usage: boxes <command> [args]
+#
+#   add <alias> <ssh-string>   Parse provider SSH string, add to config
+#   rm <alias>                 Remove a box from config
+#   ls                         List configured boxes
+#   <alias>                    SSH into a box
+#   put <alias> <local> [rem]  Sync local -> remote (default: ~/)
+#   pull <alias> <remote> [l]  Sync remote -> local (default: .)
+#   init <alias>               Run GPU init script on remote
+#   setup <alias> <ssh-string> Add + init + connect in one go
+#   wipe                       Remove all box configs
+
+BOXES_DIR="$HOME/.ssh/boxes"
+BOXES_CONFIG="$BOXES_DIR/config"
+BOXES_KNOWN="$BOXES_DIR/known_hosts"
+BOXES_INIT_URL="https://stuff.ecntu.com/init.sh"
+
+cmd_help() {
+  cat <<'EOF'
+Usage: boxes <command> [args]
+
+  add <alias> <ssh-string>   Add a box (alias first, then paste SSH command)
+  rm <alias>                 Remove a box
+  ls                         List boxes
+  <alias>                    Connect to a box
+  put <alias> <local> [rem]  Upload files (rsync, respects .gitignore)
+  pull <alias> <rem> [local] Download files
+  init <alias>               GPU init on remote
+  setup <alias> <ssh-string> Add + init + connect
+  wipe                       Remove all box configs
+EOF
+}
+
+# Add a box from a provider SSH string. Uses ssh -G to let SSH parse its own syntax.
+# Usage: boxes add <alias> [ssh] <ssh-args>
+#   e.g. boxes add big ssh root@38.147.83.31 -p 31138
+cmd_add() {
+  if [ $# -lt 2 ]; then
+    echo "Usage: boxes add <alias> [ssh] user@host [-p port] [-i key] ..."
+    return 1
+  fi
+
+  local name="$1"
+  shift
+
+  # Strip leading "ssh" if present
+  [ "${1:-}" = "ssh" ] && shift
+
+  # Let SSH parse everything — handles -p40022, -oPort=X, etc.
+  local resolved
+  resolved=$(ssh -G "$@" 2>/dev/null) || {
+    echo "Failed to parse SSH args: $*"
+    return 1
+  }
+
+  local host user port
+  host=$(echo "$resolved" | awk '/^hostname / { print $2; exit }')
+  user=$(echo "$resolved" | awk '/^user / { print $2; exit }')
+  port=$(echo "$resolved" | awk '/^port / { print $2; exit }')
+
+  mkdir -p "$BOXES_DIR"
+  touch "$BOXES_CONFIG"
+
+  if grep -qE "^Host[[:space:]]+${name}$" "$BOXES_CONFIG" 2>/dev/null; then
+    echo "Box '$name' already exists. Remove it first with: boxes rm $name"
+    return 1
+  fi
+
+  {
+    printf "Host %s\n" "$name"
+    printf "  HostName %s\n" "$host"
+    printf "  User %s\n" "$user"
+    printf "  Port %s\n" "$port"
+    printf "  UserKnownHostsFile %s\n" "$BOXES_KNOWN"
+    printf "  ForwardAgent yes\n\n"
+  } >> "$BOXES_CONFIG"
+
+  echo "Added box '$name' ($user@$host:$port)"
+}
+
+cmd_rm() {
+  local name="$1"
+  if [ -z "$name" ]; then
+    echo "Usage: boxes rm <alias>"
+    return 1
+  fi
+  if [ ! -f "$BOXES_CONFIG" ]; then
+    echo "No boxes configured."
+    return 1
+  fi
+
+  if ! grep -qE "^Host[[:space:]]+${name}$" "$BOXES_CONFIG" 2>/dev/null; then
+    echo "Box '$name' not found."
+    return 1
+  fi
+
+  # Remove the Host block: from "Host <name>" to the next "Host " or EOF
+  awk -v name="$name" '
+    BEGIN { skip=0 }
+    /^Host[[:space:]]/ {
+      if ($2 == name) { skip=1; next }
+      else { skip=0 }
+    }
+    /^[[:space:]]*$/ && skip { next }
+    !skip { print }
+  ' "$BOXES_CONFIG" > "$BOXES_CONFIG.tmp" && mv "$BOXES_CONFIG.tmp" "$BOXES_CONFIG"
+
+  echo "Removed box '$name'."
+}
+
+cmd_ls() {
+  if [ ! -f "$BOXES_CONFIG" ] || [ ! -s "$BOXES_CONFIG" ]; then
+    echo "No boxes configured."
+    return 0
+  fi
+  awk '/^Host[[:space:]]/ { name=$2 }
+       /^  HostName /     { host=$2 }
+       /^  Port /         { port=$2 }
+       /^  User /         { user=$2; printf "  %-20s %s@%s:%s\n", name, user, host, port }
+      ' "$BOXES_CONFIG"
+}
+
+cmd_connect() {
+  local name="$1"
+  shift
+  ssh "$name" "$@"
+}
+
+cmd_put() {
+  local name="$1" src="$2" dest="${3:-"~/"}"
+  if [ -z "$name" ] || [ -z "$src" ]; then
+    echo "Usage: boxes put <alias> <local-path> [remote-path]"
+    return 1
+  fi
+  rsync -avz --exclude='.git/' --filter=':- .gitignore' "$src" "${name}:${dest}"
+}
+
+cmd_pull() {
+  local name="$1" src="$2" dest="${3:-.}"
+  if [ -z "$name" ] || [ -z "$src" ]; then
+    echo "Usage: boxes pull <alias> <remote-path> [local-path]"
+    return 1
+  fi
+  rsync -avz "${name}:${src}" "$dest"
+}
+
+cmd_init() {
+  local name="$1"
+  if [ -z "$name" ]; then
+    echo "Usage: boxes init <alias>"
+    return 1
+  fi
+
+  echo "Initializing box '$name'..."
+  ssh "$name" "curl -fsSL $BOXES_INIT_URL | bash"
+}
+
+cmd_setup() {
+  cmd_add "$@"
+  local name="$1"
+  cmd_init "$name"
+  cmd_connect "$name"
+}
+
+cmd_wipe() {
+  local removed=0
+  [ -f "$BOXES_CONFIG" ] && rm -f "$BOXES_CONFIG" && echo "Removed $BOXES_CONFIG" && removed=1
+  [ -f "$BOXES_KNOWN" ] && rm -f "$BOXES_KNOWN" && echo "Removed $BOXES_KNOWN" && removed=1
+  [ "$removed" -eq 1 ] && echo "All box configs wiped." || echo "Nothing to wipe."
+}
+
+# --- main ---
+cmd="${1:-help}"
+shift 2>/dev/null || true
+
+case "$cmd" in
+  add)    cmd_add "$@" ;;
+  rm)     cmd_rm "$@" ;;
+  ls)     cmd_ls ;;
+  put)    cmd_put "$@" ;;
+  pull)   cmd_pull "$@" ;;
+  init)   cmd_init "$@" ;;
+  setup)  cmd_setup "$@" ;;
+  wipe)   cmd_wipe ;;
+  help)   cmd_help ;;
+  *)      cmd_connect "$cmd" "$@" ;;
+esac
