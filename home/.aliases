@@ -21,5 +21,10 @@ alias c="tr -d '\n' | pbcopy"
 # Recursively delete `.DS_Store` files
 alias clean-ds="find . -type f -name '*.DS_Store' -ls -delete"
 
+# Rsync but ignore .git and respect .gitignore
+rsyncg() {
+  rsync -av --exclude='.git/' --filter=':- .gitignore' "$@"
+}
+
 # System
 alias tuto='sudo shutdown -h now'

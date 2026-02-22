@@ -7,7 +7,7 @@ Managed with [GNU Stow](https://www.gnu.org/software/stow/). Requires `stow`, `z
 - **home/** — shell config (zsh, bash, aliases, functions), gitconfig, gitignore
 - **vim/** — .vimrc
 - **tmux/** — .tmux.conf
-- **custom_bins/** — scripts in `~/.local/bin` (boxes, tmpjn, rmvenvs)
+- **custom_bins/** — scripts in `~/.local/bin` (boxes, jn, rmvenvs)
 
 ## Install
 

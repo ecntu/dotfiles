@@ -19,7 +19,6 @@ rm -f \
   "$TARGET/.bashrc" \
   "$TARGET/.bash_profile" \
   "$TARGET/.aliases" \
-  "$TARGET/.functions" \
   "$TARGET/.gitignore_global" \
   "$TARGET/.zshrc" \
   "$TARGET/.gitconfig" \
