@@ -22,6 +22,7 @@ rm -f \
   "$TARGET/.functions" \
   "$TARGET/.gitignore_global" \
   "$TARGET/.zshrc" \
+  "$TARGET/.gitconfig" \
   "$TARGET/.vimrc" \
   "$TARGET/.tmux.conf" \
   "$TARGET/.config/tmux/.tmux.conf" \

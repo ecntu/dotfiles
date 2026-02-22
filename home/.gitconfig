@@ -1,0 +1,9 @@
+[user]
+	name = Emilio Cantú
+	email = 39497904+ecntu@users.noreply.github.com
+
+[init]
+	defaultBranch = main
+
+[core]
+	excludesFile = ~/.gitignore_global
