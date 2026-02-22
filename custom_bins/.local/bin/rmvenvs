@@ -11,29 +11,32 @@ echo
 
 total_bytes=0
 
-# Find all uv.lock files
-find "$ROOT" -type f -name "uv.lock" | while read -r lockfile; do
+# Find all uv.lock files (process substitution keeps the loop in the current shell)
+while read -r lockfile; do
     project_dir="$(dirname "$lockfile")"
     venv_path="$project_dir/.venv"
 
     if [ -d "$venv_path" ]; then
-        # Get size in bytes
-        size_bytes=$(du -sb "$venv_path" | awk '{print $1}')
-        size_gb=$(awk "BEGIN {printf \"%.2f\", $size_bytes/1024/1024/1024}")
+        # Get size in bytes (-b is GNU only, -k works everywhere)
+        if du -sb /dev/null &>/dev/null; then
+            size_bytes=$(du -sb "$venv_path" | awk '{print $1}')
+        else
+            size_bytes=$(( $(du -sk "$venv_path" | awk '{print $1}') * 1024 ))
+        fi
+        size_mb=$((size_bytes / 1024 / 1024))
 
         echo "📁 Found: $venv_path"
-        echo "   Size: ${size_gb} GB"
+        echo "   Size: ${size_mb} MB"
 
-        # Add to total and delete
         total_bytes=$((total_bytes + size_bytes))
         rm -rf "$venv_path"
 
         echo "   ✅ Removed."
         echo
     fi
-done
+done < <(find "$ROOT" -type f -name "uv.lock")
 
 # Print total reclaimed
-total_gb=$(awk "BEGIN {printf \"%.2f\", $total_bytes/1024/1024/1024}")
+total_mb=$((total_bytes / 1024 / 1024))
 
-echo "💾 Total space reclaimed: ${total_gb} GB"
+echo "💾 Total space reclaimed: ${total_mb} MB"
