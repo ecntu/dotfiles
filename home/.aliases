@@ -15,10 +15,6 @@ alias dirsize="du -sh * | sort -h"
 alias fpid="ps aux | fzf -m | awk '{print \$2}'" # find pid
 
 
-# Jupyter
-alias jn='jupyter notebook'
-alias jr='jupyter nbconvert --execute --to notebook --inplace --allow-errors'
-
 # Trim new lines and copy to clipboard
 alias c="tr -d '\n' | pbcopy"
 

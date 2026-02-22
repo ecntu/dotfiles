@@ -7,7 +7,6 @@ export GOPATH=$HOME/go
 # Path add exports
 export PATH="$HOME/bin:$PATH"; # Add `~/bin`
 export PATH="$PATH:$HOME/.local/bin" # Add `~/.local/bin/env` (uv)
-export PATH=$PATH:~/Library/Python/3.9/bin # python bin (jupyter etc) on mac
 export PATH=$PATH:$GOPATH/bin
 
 # Load the shell dotfiles, and then some:

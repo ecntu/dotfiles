@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Open a throwaway Jupyter notebook with common imports.
+# Temp directory is cleaned up on exit.
+
+TMP_DIR=$(mktemp -d)
+trap 'rm -rf "$TMP_DIR"' EXIT
+
+cat > "$TMP_DIR/tmp.ipynb" << 'EOF'
+{
+ "cells": [
+    {
+        "cell_type": "code",
+        "execution_count": null,
+        "metadata": {},
+        "outputs": [],
+        "source": [
+            "import numpy as np\n",
+            "import pandas as pd\n",
+            "import matplotlib.pyplot as plt"
+        ]
+    }
+ ],
+ "metadata": {},
+ "nbformat": 4,
+ "nbformat_minor": 4
+}
+EOF
+
+uvx --with numpy --with pandas --with matplotlib jupyter notebook "$TMP_DIR/tmp.ipynb"
