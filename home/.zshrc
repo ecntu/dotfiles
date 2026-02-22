@@ -3,6 +3,12 @@ export ZSH="$HOME/.oh-my-zsh"
 ZSH_THEME="robbyrussell"
 plugins=(fzf history-substring-search)
 source $ZSH/oh-my-zsh.sh
+ZSH_THEME_GIT_PROMPT_PREFIX="%F{243}(%B%F{211}"
+ZSH_THEME_GIT_PROMPT_SUFFIX="%b%F{243})%f"
+ZSH_THEME_GIT_PROMPT_DIRTY="%F{179}*"
+ZSH_THEME_GIT_PROMPT_CLEAN=""
+PROMPT='%(?:%B%F{75}:%B%F{167})%c%b%f $(git_prompt_info)%F{243}:%f '
+[[ -n "$SSH_CONNECTION" ]] && PROMPT='%F{243}(%m)%f '$PROMPT
 
 # FZF cd-widget config
 bindkey -r '^[c'
