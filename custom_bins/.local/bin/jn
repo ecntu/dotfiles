@@ -28,4 +28,4 @@ cat > "$TMP_DIR/tmp.ipynb" << 'EOF'
 }
 EOF
 
-uvx --with numpy --with pandas --with matplotlib jupyter notebook "$TMP_DIR/tmp.ipynb"
+uvx --with numpy --with pandas --with matplotlib --with pip jupyter notebook "$TMP_DIR/tmp.ipynb"
