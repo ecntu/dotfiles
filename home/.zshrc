@@ -1,6 +1,6 @@
 # Oh My Zsh
 export ZSH="$HOME/.oh-my-zsh"
-ZSH_THEME="robbyrussell"
+ZSH_THEME=""
 plugins=(fzf history-substring-search)
 source $ZSH/oh-my-zsh.sh
 ZSH_THEME_GIT_PROMPT_PREFIX="%F{243}(%B%F{211}"
