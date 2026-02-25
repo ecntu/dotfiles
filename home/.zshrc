@@ -16,9 +16,9 @@ bindkey '^f' fzf-cd-widget
 FZF_DIR_ROOTS=(
     .
     "$HOME"
-    "$HOME/Documents" "$HOME/Documents/playgrounds" "$HOME/Desktop"
+    "$HOME/Documents" "$HOME/Desktop"
 )
-export FZF_ALT_C_COMMAND="find ${(@q)FZF_DIR_ROOTS} -type d -maxdepth 1 -mindepth 1"
+export FZF_ALT_C_COMMAND="find ${(@q)FZF_DIR_ROOTS} -type d -maxdepth 2 -mindepth 1"
 
 [ -n "$PS1" ] && source ~/.bash_profile;
 
