@@ -159,7 +159,7 @@ cmd_init() {
   echo "Initializing box '$name'..."
   ssh "$name" "curl -fsSL $BOXES_INIT_URL | bash"
   echo "Setting BOX_NAME='$name'..."
-  ssh "$name" "echo 'export BOX_NAME=\"$name\"' >> ~/.bashrc"
+  ssh "$name" "echo 'export BOX_NAME=\"$name\"' >> ~/.bash_profile"
 }
 
 cmd_setup() {
