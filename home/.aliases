@@ -39,3 +39,5 @@ rsyncg() {
 
 # System
 alias tuto='sudo shutdown -h now'
+
+alias claudio='claude'
