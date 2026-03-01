@@ -18,6 +18,17 @@ alias fpid="ps aux | fzf -m | awk '{print \$2}'" # find pid
 # Trim new lines and copy to clipboard
 alias c="tr -d '\n' | pbcopy"
 
+# Join all files in a dir into one output with [filename]: delimiters
+joindir() {
+  local dir="${1:-.}"
+  for f in "$dir"/*; do
+    [ -f "$f" ] || continue
+    echo "[$(basename "$f")]:"
+    cat "$f"
+    echo
+  done
+}
+
 # Recursively delete `.DS_Store` files
 alias clean-ds="find . -type f -name '*.DS_Store' -ls -delete"
 
