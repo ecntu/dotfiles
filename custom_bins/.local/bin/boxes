@@ -19,6 +19,19 @@ BOXES_DIR="$HOME/.ssh/boxes"
 BOXES_CONFIG="$BOXES_DIR/config"
 BOXES_KNOWN="$BOXES_DIR/known_hosts"
 BOXES_INIT_URL="https://stuff.ecntu.com/init.sh"
+SSH_CONFIG="$HOME/.ssh/config"
+BOXES_INCLUDE="Include ~/.ssh/boxes/config"
+
+ensure_ssh_include() {
+  mkdir -p "$HOME/.ssh"
+  touch "$SSH_CONFIG"
+  if ! grep -qxF "$BOXES_INCLUDE" "$SSH_CONFIG" 2>/dev/null; then
+    # Include must be at the top of ssh config to take effect
+    printf '%s\n\n' "$BOXES_INCLUDE" | cat - "$SSH_CONFIG" > "$SSH_CONFIG.tmp" \
+      && mv "$SSH_CONFIG.tmp" "$SSH_CONFIG"
+    echo "Added '$BOXES_INCLUDE' to $SSH_CONFIG"
+  fi
+}
 
 cmd_help() {
   cat <<'EOF'
@@ -45,8 +58,15 @@ cmd_add() {
     return 1
   fi
 
+  ensure_ssh_include
+
   local name="$1"
   shift
+
+  if [[ ! "$name" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+    echo "Invalid alias '$name' — use only letters, numbers, hyphens, underscores."
+    return 1
+  fi
 
   # Strip leading "ssh" if present
   [ "${1:-}" = "ssh" ] && shift
@@ -77,6 +97,7 @@ cmd_add() {
     printf "  User %s\n" "$user"
     printf "  Port %s\n" "$port"
     printf "  UserKnownHostsFile %s\n" "$BOXES_KNOWN"
+    printf "  StrictHostKeyChecking no\n"
     printf "  ForwardAgent yes\n\n"
   } >> "$BOXES_CONFIG"
 
@@ -137,7 +158,7 @@ cmd_put() {
     echo "Usage: boxes put <alias> <local-path> [remote-path]"
     return 1
   fi
-  rsync -avz --exclude='.git/' --filter=':- .gitignore' "$src" "${name}:${dest}"
+  rsync -avzP --exclude='.git/' --filter=':- .gitignore' "$src" "${name}:${dest}"
 }
 
 cmd_pull() {
@@ -146,7 +167,7 @@ cmd_pull() {
     echo "Usage: boxes pull <alias> <remote-path> [local-path]"
     return 1
   fi
-  rsync -avz "${name}:${src}" "$dest"
+  rsync -avzP "${name}:${src}" "$dest"
 }
 
 cmd_init() {

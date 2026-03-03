@@ -34,10 +34,13 @@ alias clean-ds="find . -type f -name '*.DS_Store' -ls -delete"
 
 # Rsync but ignore .git and respect .gitignore
 rsyncg() {
-  rsync -av --exclude='.git/' --filter=':- .gitignore' "$@"
+  rsync -avzP --exclude='.git/' --filter=':- .gitignore' "$@"
 }
 
 # System
 alias tuto='sudo shutdown -h now'
 
 alias claudio='claude'
+
+# GPU
+alias gpu-util="nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits"
