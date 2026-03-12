@@ -24,8 +24,7 @@ rm -f \
   "$TARGET/.gitconfig" \
   "$TARGET/.vimrc" \
   "$TARGET/.tmux.conf" \
-  "$TARGET/.config/tmux/.tmux.conf" \
-  "$TARGET/.config/ghostty/config" || true
+  "$TARGET/.config/tmux/.tmux.conf" || true
 
 cd "$REPO_DIR"
 for folder in "${STOW_FOLDERS[@]}"; do
