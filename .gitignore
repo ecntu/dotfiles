@@ -1,0 +1,6 @@
+custom_bins/.local/bin/*
+!custom_bins/.local/bin/boxes
+!custom_bins/.local/bin/jn
+!custom_bins/.local/bin/rmvenvs
+custom_bins/.local/share/
+custom_bins/.local/state/
