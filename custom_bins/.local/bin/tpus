@@ -54,6 +54,7 @@ Usage: tpus <command> [args]
                                    --cycle iterates all grant_slots in priority order.
   rm <name> [--zone <z>]           Delete TPU VM; --zone to delete untracked ones
   ls [--probe]                     List tracked TPU VMs; --probe queries all grant zones
+  setup <name>                     Run init script and set BOX_NAME on TPU VM
   ssh <name> [-- extra-args]       SSH into TPU VM
   scp <name> <src> <dst>           Copy files (:path = remote side)
   sync <name> <src> <dst> [flags] rsync with gcloud SSH transport (:path = remote)
@@ -243,6 +244,27 @@ cmd_ls() {
   done < "$TPUS_STATE"
 }
 
+cmd_setup() {
+  local name="${1:-}"
+  if [ -z "$name" ]; then
+    echo "Usage: tpus setup <name>"
+    return 1
+  fi
+
+  local zone
+  zone=$(lookup_zone "$name")
+  if [ -z "$zone" ]; then
+    echo "TPU '$name' not found in state."
+    return 1
+  fi
+
+  echo "Running init script on '$name'..."
+  gcloud compute tpus tpu-vm ssh "$name" --zone="$zone" -- "curl -fsSL https://stuff.ecntu.com/init.sh | bash"
+  echo "Setting BOX_NAME='$name'..."
+  gcloud compute tpus tpu-vm ssh "$name" --zone="$zone" -- "echo 'export BOX_NAME=\"$name\"' >> ~/.bash_profile"
+  echo "Done."
+}
+
 cmd_sync() {
   local name="${1:-}"
   if [ -z "$name" ] || [ $# -lt 3 ]; then
@@ -338,6 +360,7 @@ case "$cmd" in
   add)    cmd_add    "$@" ;;
   rm)     cmd_rm     "$@" ;;
   ls)     cmd_ls "$@" ;;
+  setup)  cmd_setup  "$@" ;;
   ssh)    cmd_ssh    "$@" ;;
   scp)    cmd_scp    "$@" ;;
   sync)   cmd_sync   "$@" ;;
