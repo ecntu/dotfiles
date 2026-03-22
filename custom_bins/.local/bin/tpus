@@ -263,7 +263,8 @@ cmd_sync() {
   [[ "$src" == :* ]] && src="${name}:${src#:}"
   [[ "$dst" == :* ]] && dst="${name}:${dst#:}"
 
-  rsync -e "gcloud compute tpus tpu-vm ssh $name --zone=$zone --" "$src" "$dst" "$@"
+  # rsync passes the hostname as an extra arg to the rsh command; we drop it with shift
+  rsync -e "bash -c 'shift; exec gcloud compute tpus tpu-vm ssh \"$name\" --zone=\"$zone\" -- \"\$@\"' --" "$src" "$dst" "$@"
 }
 
 cmd_ssh() {
