@@ -1,0 +1,322 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# tpus — thin gcloud wrapper for TPU VMs
+#
+# Usage: tpus <command> [args]
+#
+#   add <name> [<gen|type>] [--size <n>] [--zone <z>] [--on-demand] [--cycle]
+#   rm <name>
+#   ls
+#   ssh <name> [-- extra-args]
+#   scp <name> <src> <dst>
+#   config [edit]
+#   wipe
+#
+# Config: ~/.config/tpus/config.json
+
+TPUS_DIR="$HOME/.config/tpus"
+TPUS_CONFIG="$TPUS_DIR/config.json"
+TPUS_STATE="$TPUS_DIR/state"   # TSV: name zone accelerator_type mode
+
+cfg() { jq -r "$1" "$TPUS_CONFIG"; }
+
+load_config() {
+  if [ ! -f "$TPUS_CONFIG" ]; then
+    echo "No config found at $TPUS_CONFIG"
+    echo "See: tpus help"
+    exit 1
+  fi
+  if ! command -v jq &>/dev/null; then
+    echo "jq is required but not installed."
+    exit 1
+  fi
+  local sa
+  sa=$(cfg '.service_account // empty')
+  if [ -z "$sa" ]; then
+    echo "service_account not set in $TPUS_CONFIG"
+    exit 1
+  fi
+}
+
+lookup_zone() {
+  local name="$1"
+  [ -f "$TPUS_STATE" ] && awk -v n="$name" '$1 == n { print $2; exit }' "$TPUS_STATE" || true
+}
+
+cmd_help() {
+  cat <<'EOF'
+Usage: tpus <command> [args]
+
+  add <name> [<gen|type>] [--size <n>] [--zone <z>] [--on-demand] [--cycle]
+                                   Create TPU VM. Defaults from config.json.
+                                   Type can be full (v6e-8) or generation only (v6e).
+                                   --cycle iterates all grant_slots in priority order.
+  rm <name> [--zone <z>]           Delete TPU VM; --zone to delete untracked ones
+  ls [--probe]                     List tracked TPU VMs; --probe queries all grant zones
+  ssh <name> [-- extra-args]       SSH into TPU VM
+  scp <name> <src> <dst>           Copy files (:path = remote side)
+  config [edit]                    Print config, or open in $EDITOR
+  wipe                             Remove all local state
+
+EOF
+}
+
+cmd_add() {
+  load_config
+
+  local name="" input="" zone="" size="" on_demand=0 cycle=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --zone)      zone="$2"; shift 2 ;;
+      --size)      size="$2"; shift 2 ;;
+      --on-demand) on_demand=1; shift ;;
+      --cycle)     cycle=1; shift ;;
+      -*)          echo "Unknown flag: $1"; return 1 ;;
+      *)
+        if   [ -z "$name"  ]; then name="$1"
+        elif [ -z "$input" ]; then input="$1"
+        else echo "Unexpected argument: $1"; return 1
+        fi
+        shift ;;
+    esac
+  done
+
+  if [ -z "$name" ]; then
+    echo "Usage: tpus add <name> [<gen|type>] [--size <n>] [--zone <zone>] [--on-demand] [--cycle]"
+    return 1
+  fi
+
+  # Parse generation and size from input (v6e-8 → gen=v6e size=8; v6e → gen=v6e)
+  local gen
+  if [ -n "$input" ]; then
+    if [[ "$input" == *-* ]]; then
+      gen="${input%-*}"
+      # --size overrides size embedded in type
+      [ -z "$size" ] && size="${input##*-}"
+    else
+      gen="$input"
+    fi
+  else
+    gen=$(cfg '.defaults.generation')
+  fi
+
+  [ -z "$size" ] && size=$(cfg '.defaults.size')
+
+  local accel="${gen}-${size}"
+
+  local default_mode
+  default_mode=$(cfg '.defaults.mode')
+  [ "$on_demand" -eq 1 ] && default_mode="on-demand"
+
+  [ -z "$zone" ] && [ "$cycle" -eq 0 ] && zone=$(cfg '.defaults.zone')
+
+  local sa
+  sa=$(cfg '.service_account')
+
+  mkdir -p "$TPUS_DIR"
+  touch "$TPUS_STATE"
+
+  if awk -v n="$name" '$1 == n { found=1 } END { exit !found }' "$TPUS_STATE" 2>/dev/null; then
+    echo "TPU '$name' is already tracked. Remove it first with: tpus rm $name"
+    return 1
+  fi
+
+  # Build candidate list
+  local -a candidates=()
+
+  if [ "$cycle" -eq 1 ]; then
+    while IFS=$'\t' read -r sg sz sm; do
+      [ "$on_demand" -eq 1 ] && [ "$sm" != "on-demand" ] && continue
+      candidates+=("$sg $sz $sm")
+    done < <(jq -r '.grant_slots[] | [.generation, .zone, .mode] | @tsv' "$TPUS_CONFIG")
+
+    if [ ${#candidates[@]} -eq 0 ]; then
+      echo "No grant slots found in $TPUS_CONFIG"
+      return 1
+    fi
+  else
+    candidates=("$gen $zone $default_mode")
+  fi
+
+  for candidate in "${candidates[@]}"; do
+    local try_gen try_zone try_mode try_accel try_runtime spot_flag
+    try_gen=$(echo "$candidate"  | awk '{print $1}')
+    try_zone=$(echo "$candidate" | awk '{print $2}')
+    try_mode=$(echo "$candidate" | awk '{print $3}')
+    try_accel="${try_gen}-${size}"
+    try_runtime=$(jq -r --arg g "$try_gen" '.runtime_versions[$g] // empty' "$TPUS_CONFIG")
+
+    if [ -z "$try_runtime" ]; then
+      echo "No runtime_version mapping for generation '$try_gen' in $TPUS_CONFIG, skipping..."
+      continue
+    fi
+
+    [ "$try_mode" = "spot" ] && spot_flag="--spot" || spot_flag=""
+
+    echo "Attempting to add '$name' — type: $try_accel, zone: $try_zone, mode: $try_mode, runtime: $try_runtime"
+
+    if gcloud compute tpus tpu-vm create "$name" \
+        --zone="$try_zone" \
+        --accelerator-type="$try_accel" \
+        --version="$try_runtime" \
+        --service-account="$sa" \
+        --metadata=startup-script='curl -fsSL https://stuff.ecntu.com/init.sh | bash' \
+        ${spot_flag:+"$spot_flag"}; then
+      echo "$name $try_zone $try_accel $try_mode" >> "$TPUS_STATE"
+      printf '\a'
+      echo "Created '$name' in $try_zone."
+      return 0
+    fi
+
+    [ "$cycle" -eq 1 ] && echo "Failed, trying next..." || return 1
+  done
+
+  echo "All candidate zones failed for '$name'."
+  return 1
+}
+
+cmd_rm() {
+  local name="" zone=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --zone) zone="$2"; shift 2 ;;
+      -*)     echo "Unknown flag: $1"; return 1 ;;
+      *)      [ -z "$name" ] && name="$1" || { echo "Unexpected argument: $1"; return 1; }; shift ;;
+    esac
+  done
+
+  if [ -z "$name" ]; then
+    echo "Usage: tpus rm <name> [--zone <zone>]"
+    return 1
+  fi
+
+  if [ -z "$zone" ]; then
+    zone=$(lookup_zone "$name")
+    if [ -z "$zone" ]; then
+      echo "TPU '$name' not found in local state. Provide --zone to delete directly."
+      return 1
+    fi
+  fi
+
+  gcloud compute tpus tpu-vm delete "$name" --zone="$zone"
+
+  if [ -f "$TPUS_STATE" ]; then
+    awk -v n="$name" '$1 != n' "$TPUS_STATE" > "$TPUS_STATE.tmp" \
+      && mv "$TPUS_STATE.tmp" "$TPUS_STATE"
+    echo "Removed '$name' from local state."
+  fi
+}
+
+cmd_ls() {
+  if [[ "${1:-}" == "--probe" ]]; then
+    load_config
+    # Collect zones: default first, then grant_slots, deduplicated
+    local default_zone
+    default_zone=$(cfg '.defaults.zone')
+    local -a zones=("$default_zone")
+    while IFS= read -r z; do
+      [[ " ${zones[*]} " == *" $z "* ]] || zones+=("$z")
+    done < <(jq -r '.grant_slots[].zone' "$TPUS_CONFIG")
+
+    for zone in "${zones[@]}"; do
+      echo "--- $zone ---"
+      gcloud compute tpus tpu-vm list --zone="$zone" 2>/dev/null || echo "(error)"
+    done
+    return 0
+  fi
+
+  if [ ! -f "$TPUS_STATE" ] || [ ! -s "$TPUS_STATE" ]; then
+    echo "No TPUs tracked."
+    return 0
+  fi
+
+  printf "%-20s %-12s %-10s %-20s %s\n" "NAME" "TYPE" "MODE" "ZONE" "STATUS"
+  while read -r name zone accel mode _rest; do
+    local status
+    status=$(gcloud compute tpus tpu-vm describe "$name" --zone="$zone" \
+      --format='get(state)' 2>/dev/null || echo "UNKNOWN")
+    printf "%-20s %-12s %-10s %-20s %s\n" "$name" "$accel" "$mode" "$zone" "$status"
+  done < "$TPUS_STATE"
+}
+
+cmd_ssh() {
+  local name="${1:-}"
+  if [ -z "$name" ]; then
+    echo "Usage: tpus ssh <name> [-- extra-args]"
+    return 1
+  fi
+  shift
+
+  local zone
+  zone=$(lookup_zone "$name")
+  if [ -z "$zone" ]; then
+    echo "TPU '$name' not found in state."
+    return 1
+  fi
+
+  gcloud compute tpus tpu-vm ssh "$name" --zone="$zone" "$@"
+}
+
+cmd_scp() {
+  local name="${1:-}"
+  if [ -z "$name" ] || [ $# -lt 3 ]; then
+    echo "Usage: tpus scp <name> <src> <dst>  (prefix :path for remote side)"
+    return 1
+  fi
+  shift
+
+  local zone
+  zone=$(lookup_zone "$name")
+  if [ -z "$zone" ]; then
+    echo "TPU '$name' not found in state."
+    return 1
+  fi
+
+  local src="$1" dst="$2"
+  shift 2
+  [[ "$src" == :* ]] && src="${name}${src}"
+  [[ "$dst" == :* ]] && dst="${name}${dst}"
+
+  gcloud compute tpus tpu-vm scp --zone="$zone" "$src" "$dst" "$@"
+}
+
+cmd_config() {
+  case "${1:-}" in
+    edit) "${EDITOR:-vi}" "$TPUS_CONFIG" ;;
+    *)
+      if [ -f "$TPUS_CONFIG" ]; then
+        jq . "$TPUS_CONFIG" 2>/dev/null || cat "$TPUS_CONFIG"
+      else
+        echo "No config found at $TPUS_CONFIG"
+      fi
+      ;;
+  esac
+}
+
+cmd_wipe() {
+  if [ -f "$TPUS_STATE" ]; then
+    rm -f "$TPUS_STATE"
+    echo "Removed $TPUS_STATE"
+  else
+    echo "Nothing to wipe."
+  fi
+}
+
+# --- main ---
+cmd="${1:-help}"
+shift 2>/dev/null || true
+
+case "$cmd" in
+  add)    cmd_add    "$@" ;;
+  rm)     cmd_rm     "$@" ;;
+  ls)     cmd_ls "$@" ;;
+  ssh)    cmd_ssh    "$@" ;;
+  scp)    cmd_scp    "$@" ;;
+  config) cmd_config "${1:-}" ;;
+  wipe)   cmd_wipe ;;
+  help)   cmd_help ;;
+  *)      echo "Unknown command: '$cmd'. Run 'tpus help'."; exit 1 ;;
+esac
