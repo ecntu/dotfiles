@@ -56,6 +56,7 @@ Usage: tpus <command> [args]
   ls [--probe]                     List tracked TPU VMs; --probe queries all grant zones
   ssh <name> [-- extra-args]       SSH into TPU VM
   scp <name> <src> <dst>           Copy files (:path = remote side)
+  sync <name> <src> <dst> [flags] rsync with gcloud SSH transport (:path = remote)
   config [edit]                    Print config, or open in $EDITOR
   wipe                             Remove all local state
 
@@ -242,6 +243,29 @@ cmd_ls() {
   done < "$TPUS_STATE"
 }
 
+cmd_sync() {
+  local name="${1:-}"
+  if [ -z "$name" ] || [ $# -lt 3 ]; then
+    echo "Usage: tpus sync <name> <src> <dst> [rsync-flags...]"
+    return 1
+  fi
+  shift
+
+  local zone
+  zone=$(lookup_zone "$name")
+  if [ -z "$zone" ]; then
+    echo "TPU '$name' not found in state."
+    return 1
+  fi
+
+  local src="$1" dst="$2"
+  shift 2
+  [[ "$src" == :* ]] && src="${name}:${src#:}"
+  [[ "$dst" == :* ]] && dst="${name}:${dst#:}"
+
+  rsync -e "gcloud compute tpus tpu-vm ssh $name --zone=$zone --" "$src" "$dst" "$@"
+}
+
 cmd_ssh() {
   local name="${1:-}"
   if [ -z "$name" ]; then
@@ -315,6 +339,7 @@ case "$cmd" in
   ls)     cmd_ls "$@" ;;
   ssh)    cmd_ssh    "$@" ;;
   scp)    cmd_scp    "$@" ;;
+  sync)   cmd_sync   "$@" ;;
   config) cmd_config "${1:-}" ;;
   wipe)   cmd_wipe ;;
   help)   cmd_help ;;
