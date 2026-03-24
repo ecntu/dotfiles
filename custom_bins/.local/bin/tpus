@@ -5,8 +5,8 @@ set -euo pipefail
 #
 # Usage: tpus <command> [args]
 #
-#   add <name> [<gen|type>] [--size <n>] [--zone <z>] [--on-demand] [--cycle]
-#   rm <name>
+#   add <name> [<gen|type>] [--size <n>] [--zone <z>] [--on-demand] [--cycle] [--no-setup]
+#   rm <name>|--all
 #   ls
 #   ssh <name> [-- extra-args]
 #   scp <name> <src> <dst>
@@ -48,11 +48,12 @@ cmd_help() {
   cat <<'EOF'
 Usage: tpus <command> [args]
 
-  add <name> [<gen|type>] [--size <n>] [--zone <z>] [--on-demand] [--cycle]
+  add <name> [<gen|type>] [--size <n>] [--zone <z>] [--on-demand] [--cycle] [--no-setup]
                                    Create TPU VM. Defaults from config.json.
                                    Type can be full (v6e-8) or generation only (v6e).
                                    --cycle iterates all grant_slots in priority order.
-  rm <name> [--zone <z>]           Delete TPU VM; --zone to delete untracked ones
+                                   By default, also runs setup and then ssh.
+  rm <name> [--zone <z>] | --all   Delete one TPU VM, or all tracked TPU VMs
   ls [--probe]                     List tracked TPU VMs; --probe queries all grant zones
   setup <name>                     Run init script and set BOX_NAME on TPU VM
   ssh <name> [-- extra-args]       SSH into TPU VM
@@ -67,7 +68,7 @@ EOF
 cmd_add() {
   load_config
 
-  local name="" input="" zone="" size="" on_demand=0 cycle=0
+  local name="" input="" zone="" size="" on_demand=0 cycle=0 no_setup=0
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -75,6 +76,7 @@ cmd_add() {
       --size)      size="$2"; shift 2 ;;
       --on-demand) on_demand=1; shift ;;
       --cycle)     cycle=1; shift ;;
+      --no-setup)  no_setup=1; shift ;;
       -*)          echo "Unknown flag: $1"; return 1 ;;
       *)
         if   [ -z "$name"  ]; then name="$1"
@@ -86,7 +88,7 @@ cmd_add() {
   done
 
   if [ -z "$name" ]; then
-    echo "Usage: tpus add <name> [<gen|type>] [--size <n>] [--zone <zone>] [--on-demand] [--cycle]"
+    echo "Usage: tpus add <name> [<gen|type>] [--size <n>] [--zone <zone>] [--on-demand] [--cycle] [--no-setup]"
     return 1
   fi
 
@@ -169,6 +171,17 @@ cmd_add() {
       echo "$name $try_zone $try_accel $try_mode" >> "$TPUS_STATE"
       printf '\a'
       echo "Created '$name' in $try_zone."
+      if [ "$no_setup" -eq 0 ]; then
+        echo "Waiting for '$name' to accept SSH..."
+        until gcloud compute tpus tpu-vm ssh "$name" --zone="$try_zone" -- true 2>/dev/null; do
+          sleep 5
+        done
+        if ! cmd_setup "$name"; then
+          echo "Setup failed. To retry: tpus setup $name && tpus ssh $name" >&2
+          return 1
+        fi
+        cmd_ssh "$name"
+      fi
       return 0
     fi
 
@@ -179,19 +192,74 @@ cmd_add() {
   return 1
 }
 
+remove_state_entry() {
+  local name="$1"
+
+  [ -f "$TPUS_STATE" ] || return 0
+
+  awk -v n="$name" '$1 != n' "$TPUS_STATE" > "$TPUS_STATE.tmp" \
+    && mv "$TPUS_STATE.tmp" "$TPUS_STATE"
+}
+
+cmd_rm_all() {
+  if [ ! -f "$TPUS_STATE" ] || [ ! -s "$TPUS_STATE" ]; then
+    echo "No TPUs tracked."
+    return 0
+  fi
+
+  local count
+  count=$(grep -c . "$TPUS_STATE")
+  read -rp "Delete all $count tracked TPU(s)? [y/N] " yn
+  [[ "$yn" == [yY] ]] || { echo "Aborted."; return 0; }
+
+  local tmp_state failures=0
+  tmp_state=$(mktemp "$TPUS_DIR/state.XXXXXX")
+
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+
+    local name zone _
+    read -r name zone _ <<< "$line"
+
+    if gcloud compute tpus tpu-vm delete "$name" --zone="$zone"; then
+      echo "Removed '$name' from local state."
+    else
+      echo "$line" >> "$tmp_state"
+      failures=1
+    fi
+  done < "$TPUS_STATE"
+
+  mv "$tmp_state" "$TPUS_STATE"
+
+  if [ "$failures" -ne 0 ]; then
+    echo "Some TPU deletions failed; failed entries were kept in local state." >&2
+    return 1
+  fi
+}
+
 cmd_rm() {
-  local name="" zone=""
+  local name="" zone="" all=0
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
+      --all)  all=1; shift ;;
       --zone) zone="$2"; shift 2 ;;
       -*)     echo "Unknown flag: $1"; return 1 ;;
       *)      [ -z "$name" ] && name="$1" || { echo "Unexpected argument: $1"; return 1; }; shift ;;
     esac
   done
 
+  if [ "$all" -eq 1 ]; then
+    if [ -n "$name" ] || [ -n "$zone" ]; then
+      echo "Usage: tpus rm --all"
+      return 1
+    fi
+    cmd_rm_all
+    return 0
+  fi
+
   if [ -z "$name" ]; then
-    echo "Usage: tpus rm <name> [--zone <zone>]"
+    echo "Usage: tpus rm <name> [--zone <zone>] | tpus rm --all"
     return 1
   fi
 
@@ -205,11 +273,8 @@ cmd_rm() {
 
   gcloud compute tpus tpu-vm delete "$name" --zone="$zone"
 
-  if [ -f "$TPUS_STATE" ]; then
-    awk -v n="$name" '$1 != n' "$TPUS_STATE" > "$TPUS_STATE.tmp" \
-      && mv "$TPUS_STATE.tmp" "$TPUS_STATE"
-    echo "Removed '$name' from local state."
-  fi
+  remove_state_entry "$name"
+  echo "Removed '$name' from local state."
 }
 
 cmd_ls() {
