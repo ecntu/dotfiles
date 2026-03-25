@@ -266,15 +266,36 @@ cmd_rm() {
   if [ -z "$zone" ]; then
     zone=$(lookup_zone "$name")
     if [ -z "$zone" ]; then
-      echo "TPU '$name' not found in local state. Provide --zone to delete directly."
-      return 1
+      load_config
+      echo "TPU '$name' not in local state — probing configured zones..."
+      local -a found_zones=()
+      local probe_zone
+      while IFS= read -r probe_zone; do
+        if gcloud compute tpus tpu-vm describe "$name" --zone="$probe_zone" &>/dev/null; then
+          found_zones+=("$probe_zone")
+        fi
+      done < <({ echo "$(cfg '.defaults.zone')"; jq -r '.grant_slots[].zone' "$TPUS_CONFIG"; } | sort -u)
+
+      case "${#found_zones[@]}" in
+        0) echo "TPU '$name' not found in any configured zone."; return 1 ;;
+        1) zone="${found_zones[0]}"; echo "Found '$name' in $zone." ;;
+        *) echo "TPU '$name' found in multiple zones: ${found_zones[*]}. Use --zone to specify."; return 1 ;;
+      esac
     fi
   fi
 
-  gcloud compute tpus tpu-vm delete "$name" --zone="$zone"
+  local rc=0
+  gcloud compute tpus tpu-vm delete "$name" --zone="$zone" || rc=$?
+  if [ $rc -ne 0 ]; then
+    if ! gcloud compute tpus tpu-vm describe "$name" --zone="$zone" &>/dev/null; then
+      echo "TPU '$name' was already gone remotely; cleaning up local state."
+    else
+      return $rc
+    fi
+  fi
 
   remove_state_entry "$name"
-  echo "Removed '$name' from local state."
+  echo "Removed '$name'."
 }
 
 cmd_ls() {
