@@ -5,3 +5,4 @@ custom_bins/.local/bin/*
 !custom_bins/.local/bin/tpus
 custom_bins/.local/share/
 custom_bins/.local/state/
+nvim/**/*.json

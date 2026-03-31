@@ -6,6 +6,7 @@ Managed with [GNU Stow](https://www.gnu.org/software/stow/). Requires `stow`, `z
 
 - **home/** — shell config (zsh, bash, aliases, functions), gitconfig, gitignore
 - **vim/** — .vimrc
+- **nvim/** — Neovim config in `~/.config/nvim/init.lua`
 - **tmux/** — .tmux.conf
 - **custom_bins/** — scripts in `~/.local/bin` (boxes, jn, rmvenvs)
 
