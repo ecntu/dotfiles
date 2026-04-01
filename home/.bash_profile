@@ -9,6 +9,10 @@ export PATH="$HOME/bin:$PATH"; # Add `~/bin`
 export PATH="$PATH:$HOME/.local/bin" # Add `~/.local/bin/env` (uv)
 export PATH=$PATH:$GOPATH/bin
 
+# Package hygiene
+export UV_EXCLUDE_NEWER="7 days"
+export NPM_CONFIG_MIN_RELEASE_AGE=7
+
 # Load the shell dotfiles, and then some:
 # * ~/.path can be used to extend `$PATH`.
 # * ~/.extra can be used for other settings you don’t want to commit.
