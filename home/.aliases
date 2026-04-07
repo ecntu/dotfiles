@@ -31,6 +31,7 @@ joindir() {
 
 # Recursively delete `.DS_Store` files
 alias clean-ds="find . -type f -name '*.DS_Store' -ls -delete"
+alias todo='rg -n "TODO|FIX"'
 
 # Rsync but ignore .git and respect .gitignore
 rsyncg() {
@@ -40,7 +41,8 @@ rsyncg() {
 # System
 alias tuto='sudo shutdown -h now'
 
-alias claudio='claude'
+alias claudio='claude --dangerously-skip-permissions'
+alias cogex='codex --full-auto'
 
 # GPU
 alias gpu-util="nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits"
