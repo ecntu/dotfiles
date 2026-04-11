@@ -54,7 +54,7 @@ rsyncg() {
 alias tuto='sudo shutdown -h now'
 
 alias claudio='claude --dangerously-skip-permissions'
-alias cogex='codex --full-auto'
+alias cogex='codex --dangerously-bypass-approvals-and-sandbox'
 
 # GPU
 alias gpu-util="nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits"

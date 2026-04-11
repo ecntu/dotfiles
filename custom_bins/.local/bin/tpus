@@ -1,457 +1,1036 @@
-#!/usr/bin/env bash
-set -euo pipefail
-
-# tpus — thin gcloud wrapper for TPU VMs
-#
-# Usage: tpus <command> [args]
-#
-#   add <name> [<gen|type>] [--size <n>] [--zone <z>] [--on-demand] [--cycle] [--no-setup]
-#   rm <name>|--all
-#   ls
-#   ssh <name> [-- extra-args]
-#   scp <name> <src> <dst>
-#   config [edit]
-#   wipe
-#
-# Config: ~/.config/tpus/config.json
-
-TPUS_DIR="$HOME/.config/tpus"
-TPUS_CONFIG="$TPUS_DIR/config.json"
-TPUS_STATE="$TPUS_DIR/state"   # TSV: name zone accelerator_type mode
-
-cfg() { jq -r "$1" "$TPUS_CONFIG"; }
-
-load_config() {
-  if [ ! -f "$TPUS_CONFIG" ]; then
-    echo "No config found at $TPUS_CONFIG"
-    echo "See: tpus help"
-    exit 1
-  fi
-  if ! command -v jq &>/dev/null; then
-    echo "jq is required but not installed."
-    exit 1
-  fi
-  local sa
-  sa=$(cfg '.service_account // empty')
-  if [ -z "$sa" ]; then
-    echo "service_account not set in $TPUS_CONFIG"
-    exit 1
-  fi
-}
-
-lookup_zone() {
-  local name="$1"
-  [ -f "$TPUS_STATE" ] && awk -v n="$name" '$1 == n { print $2; exit }' "$TPUS_STATE" || true
-}
-
-cmd_help() {
-  cat <<'EOF'
-Usage: tpus <command> [args]
-
-  add <name> [<gen|type>] [--size <n>] [--zone <z>] [--on-demand] [--cycle] [--no-setup]
-                                   Create TPU VM. Defaults from config.json.
-                                   Type can be full (v6e-8) or generation only (v6e).
-                                   --cycle iterates all grant_slots in priority order.
-                                   By default, also runs setup and then ssh.
-  rm <name> [--zone <z>] | --all   Delete one TPU VM, or all tracked TPU VMs
-  ls [--probe]                     List tracked TPU VMs; --probe queries all grant zones
-  setup <name>                     Run init script and set BOX_NAME on TPU VM
-  ssh <name> [-- extra-args]       SSH into TPU VM
-  scp <name> <src> <dst>           Copy files (:path = remote side)
-  sync <name> <src> <dst> [flags] rsync with gcloud SSH transport (:path = remote)
-  config [edit]                    Print config, or open in $EDITOR
-  wipe                             Remove all local state
-
-EOF
-}
-
-cmd_add() {
-  load_config
-
-  local name="" input="" zone="" size="" on_demand=0 cycle=0 no_setup=0
-
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --zone)      zone="$2"; shift 2 ;;
-      --size)      size="$2"; shift 2 ;;
-      --on-demand) on_demand=1; shift ;;
-      --cycle)     cycle=1; shift ;;
-      --no-setup)  no_setup=1; shift ;;
-      -*)          echo "Unknown flag: $1"; return 1 ;;
-      *)
-        if   [ -z "$name"  ]; then name="$1"
-        elif [ -z "$input" ]; then input="$1"
-        else echo "Unexpected argument: $1"; return 1
-        fi
-        shift ;;
-    esac
-  done
-
-  if [ -z "$name" ]; then
-    echo "Usage: tpus add <name> [<gen|type>] [--size <n>] [--zone <zone>] [--on-demand] [--cycle] [--no-setup]"
-    return 1
-  fi
-
-  # Parse generation and size from input (v6e-8 → gen=v6e size=8; v6e → gen=v6e)
-  local gen
-  if [ -n "$input" ]; then
-    if [[ "$input" == *-* ]]; then
-      gen="${input%-*}"
-      # --size overrides size embedded in type
-      [ -z "$size" ] && size="${input##*-}"
-    else
-      gen="$input"
-    fi
-  else
-    gen=$(cfg '.defaults.generation')
-  fi
-
-  [ -z "$size" ] && size=$(cfg '.defaults.size')
-
-  local accel="${gen}-${size}"
-
-  local default_mode
-  default_mode=$(cfg '.defaults.mode')
-  [ "$on_demand" -eq 1 ] && default_mode="on-demand"
-
-  [ -z "$zone" ] && [ "$cycle" -eq 0 ] && zone=$(cfg '.defaults.zone')
-
-  local sa
-  sa=$(cfg '.service_account')
-
-  mkdir -p "$TPUS_DIR"
-  touch "$TPUS_STATE"
-
-  if awk -v n="$name" '$1 == n { found=1 } END { exit !found }' "$TPUS_STATE" 2>/dev/null; then
-    echo "TPU '$name' is already tracked. Remove it first with: tpus rm $name"
-    return 1
-  fi
-
-  # Build candidate list
-  local -a candidates=()
-
-  if [ "$cycle" -eq 1 ]; then
-    while IFS=$'\t' read -r sg sz sm; do
-      [ "$on_demand" -eq 1 ] && [ "$sm" != "on-demand" ] && continue
-      candidates+=("$sg $sz $sm")
-    done < <(jq -r '.grant_slots[] | [.generation, .zone, .mode] | @tsv' "$TPUS_CONFIG")
-
-    if [ ${#candidates[@]} -eq 0 ]; then
-      echo "No grant slots found in $TPUS_CONFIG"
-      return 1
-    fi
-  else
-    candidates=("$gen $zone $default_mode")
-  fi
-
-  for candidate in "${candidates[@]}"; do
-    local try_gen try_zone try_mode try_accel try_runtime spot_flag
-    try_gen=$(echo "$candidate"  | awk '{print $1}')
-    try_zone=$(echo "$candidate" | awk '{print $2}')
-    try_mode=$(echo "$candidate" | awk '{print $3}')
-    try_accel="${try_gen}-${size}"
-    try_runtime=$(jq -r --arg g "$try_gen" '.runtime_versions[$g] // empty' "$TPUS_CONFIG")
-
-    if [ -z "$try_runtime" ]; then
-      echo "No runtime_version mapping for generation '$try_gen' in $TPUS_CONFIG, skipping..."
-      continue
-    fi
-
-    [ "$try_mode" = "spot" ] && spot_flag="--spot" || spot_flag=""
-
-    echo "Attempting to add '$name' — type: $try_accel, zone: $try_zone, mode: $try_mode, runtime: $try_runtime"
-
-    if gcloud compute tpus tpu-vm create "$name" \
-        --zone="$try_zone" \
-        --accelerator-type="$try_accel" \
-        --version="$try_runtime" \
-        --service-account="$sa" \
-        --metadata=startup-script='curl -fsSL https://stuff.ecntu.com/init.sh | bash' \
-        ${spot_flag:+"$spot_flag"}; then
-      echo "$name $try_zone $try_accel $try_mode" >> "$TPUS_STATE"
-      printf '\a'
-      echo "Created '$name' in $try_zone."
-      if [ "$no_setup" -eq 0 ]; then
-        echo "Waiting for '$name' to accept SSH..."
-        until gcloud compute tpus tpu-vm ssh "$name" --zone="$try_zone" -- true 2>/dev/null; do
-          sleep 5
-        done
-        if ! cmd_setup "$name"; then
-          echo "Setup failed. To retry: tpus setup $name && tpus ssh $name" >&2
-          return 1
-        fi
-        cmd_ssh "$name"
-      fi
-      return 0
-    fi
-
-    [ "$cycle" -eq 1 ] && echo "Failed, trying next..." || return 1
-  done
-
-  echo "All candidate zones failed for '$name'."
-  return 1
-}
-
-remove_state_entry() {
-  local name="$1"
-
-  [ -f "$TPUS_STATE" ] || return 0
-
-  awk -v n="$name" '$1 != n' "$TPUS_STATE" > "$TPUS_STATE.tmp" \
-    && mv "$TPUS_STATE.tmp" "$TPUS_STATE"
-}
-
-cmd_rm_all() {
-  if [ ! -f "$TPUS_STATE" ] || [ ! -s "$TPUS_STATE" ]; then
-    echo "No TPUs tracked."
-    return 0
-  fi
-
-  local count
-  count=$(grep -c . "$TPUS_STATE")
-  read -rp "Delete all $count tracked TPU(s)? [y/N] " yn
-  [[ "$yn" == [yY] ]] || { echo "Aborted."; return 0; }
-
-  local tmp_state failures=0
-  tmp_state=$(mktemp "$TPUS_DIR/state.XXXXXX")
-
-  while IFS= read -r line; do
-    [ -z "$line" ] && continue
-
-    local name zone _
-    read -r name zone _ <<< "$line"
-
-    if gcloud compute tpus tpu-vm delete "$name" --zone="$zone"; then
-      echo "Removed '$name' from local state."
-    else
-      echo "$line" >> "$tmp_state"
-      failures=1
-    fi
-  done < "$TPUS_STATE"
-
-  mv "$tmp_state" "$TPUS_STATE"
-
-  if [ "$failures" -ne 0 ]; then
-    echo "Some TPU deletions failed; failed entries were kept in local state." >&2
-    return 1
-  fi
-}
-
-cmd_rm() {
-  local name="" zone="" all=0
-
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --all)  all=1; shift ;;
-      --zone) zone="$2"; shift 2 ;;
-      -*)     echo "Unknown flag: $1"; return 1 ;;
-      *)      [ -z "$name" ] && name="$1" || { echo "Unexpected argument: $1"; return 1; }; shift ;;
-    esac
-  done
-
-  if [ "$all" -eq 1 ]; then
-    if [ -n "$name" ] || [ -n "$zone" ]; then
-      echo "Usage: tpus rm --all"
-      return 1
-    fi
-    cmd_rm_all
-    return 0
-  fi
-
-  if [ -z "$name" ]; then
-    echo "Usage: tpus rm <name> [--zone <zone>] | tpus rm --all"
-    return 1
-  fi
-
-  if [ -z "$zone" ]; then
-    zone=$(lookup_zone "$name")
-    if [ -z "$zone" ]; then
-      load_config
-      echo "TPU '$name' not in local state — probing configured zones..."
-      local -a found_zones=()
-      local probe_zone
-      while IFS= read -r probe_zone; do
-        if gcloud compute tpus tpu-vm describe "$name" --zone="$probe_zone" &>/dev/null; then
-          found_zones+=("$probe_zone")
-        fi
-      done < <({ echo "$(cfg '.defaults.zone')"; jq -r '.grant_slots[].zone' "$TPUS_CONFIG"; } | sort -u)
-
-      case "${#found_zones[@]}" in
-        0) echo "TPU '$name' not found in any configured zone."; return 1 ;;
-        1) zone="${found_zones[0]}"; echo "Found '$name' in $zone." ;;
-        *) echo "TPU '$name' found in multiple zones: ${found_zones[*]}. Use --zone to specify."; return 1 ;;
-      esac
-    fi
-  fi
-
-  local rc=0
-  gcloud compute tpus tpu-vm delete "$name" --zone="$zone" || rc=$?
-  if [ $rc -ne 0 ]; then
-    if ! gcloud compute tpus tpu-vm describe "$name" --zone="$zone" &>/dev/null; then
-      echo "TPU '$name' was already gone remotely; cleaning up local state."
-    else
-      return $rc
-    fi
-  fi
-
-  remove_state_entry "$name"
-  echo "Removed '$name'."
-}
-
-cmd_ls() {
-  if [[ "${1:-}" == "--probe" ]]; then
-    load_config
-    # Collect zones: default first, then grant_slots, deduplicated
-    local default_zone
-    default_zone=$(cfg '.defaults.zone')
-    local -a zones=("$default_zone")
-    while IFS= read -r z; do
-      [[ " ${zones[*]} " == *" $z "* ]] || zones+=("$z")
-    done < <(jq -r '.grant_slots[].zone' "$TPUS_CONFIG")
-
-    for zone in "${zones[@]}"; do
-      echo "--- $zone ---"
-      gcloud compute tpus tpu-vm list --zone="$zone" 2>/dev/null || echo "(error)"
-    done
-    return 0
-  fi
-
-  if [ ! -f "$TPUS_STATE" ] || [ ! -s "$TPUS_STATE" ]; then
-    echo "No TPUs tracked."
-    return 0
-  fi
-
-  printf "%-20s %-12s %-10s %-20s %s\n" "NAME" "TYPE" "MODE" "ZONE" "STATUS"
-  while read -r name zone accel mode _rest; do
-    local status
-    status=$(gcloud compute tpus tpu-vm describe "$name" --zone="$zone" \
-      --format='get(state)' 2>/dev/null || echo "UNKNOWN")
-    printf "%-20s %-12s %-10s %-20s %s\n" "$name" "$accel" "$mode" "$zone" "$status"
-  done < "$TPUS_STATE"
-}
-
-cmd_setup() {
-  local name="${1:-}"
-  if [ -z "$name" ]; then
-    echo "Usage: tpus setup <name>"
-    return 1
-  fi
-
-  local zone
-  zone=$(lookup_zone "$name")
-  if [ -z "$zone" ]; then
-    echo "TPU '$name' not found in state."
-    return 1
-  fi
-
-  echo "Running init script on '$name'..."
-  gcloud compute tpus tpu-vm ssh "$name" --zone="$zone" -- "curl -fsSL https://stuff.ecntu.com/init.sh | bash"
-  echo "Setting BOX_NAME='$name'..."
-  gcloud compute tpus tpu-vm ssh "$name" --zone="$zone" -- "echo 'export BOX_NAME=\"$name\"' >> ~/.bash_profile"
-  echo "Done."
-}
-
-cmd_sync() {
-  local name="${1:-}"
-  if [ -z "$name" ] || [ $# -lt 3 ]; then
-    echo "Usage: tpus sync <name> <src> <dst> [rsync-flags...]"
-    return 1
-  fi
-  shift
-
-  local zone
-  zone=$(lookup_zone "$name")
-  if [ -z "$zone" ]; then
-    echo "TPU '$name' not found in state."
-    return 1
-  fi
-
-  local src="$1" dst="$2"
-  shift 2
-  [[ "$src" == :* ]] && src="${name}:${src#:}"
-  [[ "$dst" == :* ]] && dst="${name}:${dst#:}"
-
-  # rsync passes the hostname as an extra arg to the rsh command; we drop it with shift
-  rsync -e "bash -c 'shift; exec gcloud compute tpus tpu-vm ssh \"$name\" --zone=\"$zone\" -- \"\$@\"' --" "$src" "$dst" "$@"
-}
-
-cmd_ssh() {
-  local name="${1:-}"
-  if [ -z "$name" ]; then
-    echo "Usage: tpus ssh <name> [-- extra-args]"
-    return 1
-  fi
-  shift
-
-  local zone
-  zone=$(lookup_zone "$name")
-  if [ -z "$zone" ]; then
-    echo "TPU '$name' not found in state."
-    return 1
-  fi
-
-  gcloud compute tpus tpu-vm ssh "$name" --zone="$zone" "$@"
-}
-
-cmd_scp() {
-  local name="${1:-}"
-  if [ -z "$name" ] || [ $# -lt 3 ]; then
-    echo "Usage: tpus scp <name> <src> <dst>  (prefix :path for remote side)"
-    return 1
-  fi
-  shift
-
-  local zone
-  zone=$(lookup_zone "$name")
-  if [ -z "$zone" ]; then
-    echo "TPU '$name' not found in state."
-    return 1
-  fi
-
-  local src="$1" dst="$2"
-  shift 2
-  [[ "$src" == :* ]] && src="${name}${src}"
-  [[ "$dst" == :* ]] && dst="${name}${dst}"
-
-  gcloud compute tpus tpu-vm scp --zone="$zone" "$src" "$dst" "$@"
-}
-
-cmd_config() {
-  case "${1:-}" in
-    edit) "${EDITOR:-vi}" "$TPUS_CONFIG" ;;
-    *)
-      if [ -f "$TPUS_CONFIG" ]; then
-        jq . "$TPUS_CONFIG" 2>/dev/null || cat "$TPUS_CONFIG"
-      else
-        echo "No config found at $TPUS_CONFIG"
-      fi
-      ;;
-  esac
-}
-
-cmd_wipe() {
-  if [ -f "$TPUS_STATE" ]; then
-    rm -f "$TPUS_STATE"
-    echo "Removed $TPUS_STATE"
-  else
-    echo "Nothing to wipe."
-  fi
-}
-
-# --- main ---
-cmd="${1:-help}"
-shift 2>/dev/null || true
-
-case "$cmd" in
-  add)    cmd_add    "$@" ;;
-  rm)     cmd_rm     "$@" ;;
-  ls)     cmd_ls "$@" ;;
-  setup)  cmd_setup  "$@" ;;
-  ssh)    cmd_ssh    "$@" ;;
-  scp)    cmd_scp    "$@" ;;
-  sync)   cmd_sync   "$@" ;;
-  config) cmd_config "${1:-}" ;;
-  wipe)   cmd_wipe ;;
-  help)   cmd_help ;;
-  *)      echo "Unknown command: '$cmd'. Run 'tpus help'."; exit 1 ;;
-esac
+#!/usr/bin/env python3
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+TPUS_DIR = Path.home() / '.config' / 'tpus'
+TPUS_CONFIG = TPUS_DIR / 'config.json'
+TPUS_STATE_JSON = TPUS_DIR / 'state.json'
+TPUS_STATE_TSV = TPUS_DIR / 'state'
+STARTUP_SCRIPT = 'curl -fsSL https://stuff.ecntu.com/init.sh | bash'
+READY_STATES = {'READY', 'RUNNING', 'ACTIVE', 'HEALTHY'}
+MISSING_STATES = {'PREEMPTED', 'TERMINATED', 'STOPPED', 'UNKNOWN', 'MISSING'}
+FULL_PROBE_TTL_SECONDS = 3600
+
+
+class UsageError(Exception):
+    pass
+
+
+class CommandError(Exception):
+    pass
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec='seconds')
+
+
+def parse_iso(ts: str | None):
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(ts)
+    except ValueError:
+        return None
+
+
+def should_auto_probe(state: dict) -> bool:
+    last_probe = parse_iso(state.get('last_full_probe_at'))
+    if last_probe is None:
+        return True
+    if last_probe.tzinfo is None:
+        last_probe = last_probe.replace(tzinfo=timezone.utc)
+    age = datetime.now(timezone.utc) - last_probe.astimezone(timezone.utc)
+    return age.total_seconds() >= FULL_PROBE_TTL_SECONDS
+
+
+def ensure_dir() -> None:
+    TPUS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def read_json(path: Path, default):
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        raise CommandError(f'Invalid JSON in {path}: {exc}') from exc
+
+
+def write_json(path: Path, payload) -> None:
+    ensure_dir()
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + '\n')
+
+
+def load_state() -> dict:
+    ensure_dir()
+    if TPUS_STATE_JSON.exists():
+        data = read_json(TPUS_STATE_JSON, {'machines': {}, 'version': 1})
+        data.setdefault('machines', {})
+        data.setdefault('version', 1)
+        data.setdefault('last_full_probe_at', None)
+        return data
+    state = {'machines': {}, 'version': 1, 'last_full_probe_at': None}
+    if TPUS_STATE_TSV.exists():
+        for line in TPUS_STATE_TSV.read_text().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            name, zone, accel, mode = parts[:4]
+            state['machines'][name] = {
+                'name': name,
+                'zone': zone,
+                'type': accel,
+                'mode': mode,
+                'note': '',
+                'created_at': None,
+                'setup_complete': False,
+            }
+        write_json(TPUS_STATE_JSON, state)
+    return state
+
+
+def save_state(state: dict) -> None:
+    write_json(TPUS_STATE_JSON, state)
+
+
+def load_config(required: bool = True) -> dict:
+    if not TPUS_CONFIG.exists():
+        if required:
+            raise CommandError(f'No config found at {TPUS_CONFIG}')
+        return {}
+    config = read_json(TPUS_CONFIG, {})
+    if required and not config.get('service_account'):
+        raise CommandError(f'service_account not set in {TPUS_CONFIG}')
+    return config
+
+
+def print_json(payload) -> None:
+    print(json.dumps(payload, indent=2, sort_keys=True))
+
+
+def run(cmd, *, check=True, capture_output=False, text=True, input_text=None):
+    result = subprocess.run(
+        cmd,
+        check=False,
+        capture_output=capture_output,
+        text=text,
+        input=input_text,
+    )
+    if check and result.returncode != 0:
+        stderr = (result.stderr or '').strip()
+        stdout = (result.stdout or '').strip()
+        detail = stderr or stdout or f'command failed with exit code {result.returncode}'
+        raise CommandError(detail)
+    return result
+
+
+def gcloud(*args, check=True, capture_output=False):
+    cmd = ['gcloud', *args]
+    return run(cmd, check=check, capture_output=capture_output)
+
+
+def editor() -> str:
+    return os.environ.get('EDITOR', 'vi')
+
+
+def configured_zones(config: dict) -> list[str]:
+    zones = []
+    default_zone = config.get('defaults', {}).get('zone')
+    if default_zone:
+        zones.append(default_zone)
+    for slot in config.get('grant_slots', []):
+        zone = slot.get('zone')
+        if zone and zone not in zones:
+            zones.append(zone)
+    return zones
+
+
+def derive_generation(accel_type: str) -> str:
+    m = re.match(r'(.+)-\d+$', accel_type)
+    return m.group(1) if m else accel_type
+
+
+def split_type(accel_type: str) -> tuple[str, int]:
+    m = re.fullmatch(r'(.+)-(\d+)', accel_type)
+    if not m:
+        raise CommandError(f"Invalid TPU type '{accel_type}'. Expected forms like v4-8 or v6e-32.")
+    return m.group(1), int(m.group(2))
+
+
+def ensure_full_type(config: dict, accel_type: str | None) -> str:
+    defaults = config.get('defaults', {})
+    default_type = defaults.get('type')
+    if accel_type:
+        m = re.match(r'.+-\d+$', accel_type)
+        if m:
+            return accel_type
+        if default_type:
+            _, size = split_type(default_type)
+            return f'{accel_type}-{size}'
+        size = defaults.get('size')
+        if not size:
+            raise CommandError('defaults.type or defaults.size not set in config.json')
+        return f'{accel_type}-{size}'
+    if default_type:
+        return default_type
+    generation = defaults.get('generation')
+    size = defaults.get('size')
+    if not generation or not size:
+        raise CommandError('defaults.type or defaults.generation/defaults.size not set in config.json')
+    return f'{generation}-{size}'
+
+
+def runtime_for_type(config: dict, accel_type: str) -> str:
+    versions = config.get('runtime_versions', {})
+    generation = derive_generation(accel_type)
+    runtime = versions.get(accel_type) or versions.get(generation)
+    if not runtime:
+        raise CommandError(f"No runtime_version mapping for '{generation}' or '{accel_type}' in {TPUS_CONFIG}")
+    return runtime
+
+
+def normalize_tpu_name(name: str) -> str:
+    return name.rstrip('/').split('/')[-1]
+
+
+def get_machine(state: dict, name: str):
+    return state['machines'].get(normalize_tpu_name(name))
+
+
+def set_machine(state: dict, machine: dict) -> None:
+    machine['name'] = normalize_tpu_name(machine['name'])
+    state['machines'][machine['name']] = machine
+
+
+def remove_machine(state: dict, name: str) -> None:
+    state['machines'].pop(normalize_tpu_name(name), None)
+
+
+def parse_name_suffix(base_name: str, suffix: str | None) -> str:
+    return f'{base_name}-{suffix}' if suffix else base_name
+
+
+def probe_machine(name: str, zone: str):
+    result = gcloud(
+        'compute', 'tpus', 'tpu-vm', 'describe', name,
+        f'--zone={zone}',
+        '--format=json(name,state,acceleratorType)',
+        check=False,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        return json.loads(result.stdout or '{}')
+    except json.JSONDecodeError:
+        return None
+
+
+def probe_machine_across_zones(config: dict, name: str):
+    found = []
+    for zone in configured_zones(config):
+        info = probe_machine(name, zone)
+        if info is not None:
+            found.append((zone, info))
+    return found
+
+
+def list_remote_machines(config: dict):
+    machines = {}
+    for zone in configured_zones(config):
+        result = gcloud(
+            'compute', 'tpus', 'tpu-vm', 'list',
+            f'--zone={zone}',
+            '--format=json(name,state,acceleratorType)',
+            check=False,
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            continue
+        try:
+            payload = json.loads(result.stdout or '[]')
+        except json.JSONDecodeError:
+            continue
+        for item in payload:
+            name = normalize_tpu_name(item.get('name', ''))
+            if not name:
+                continue
+            machines[name] = {
+                'name': name,
+                'zone': zone,
+                'type': item.get('acceleratorType', ''),
+                'state': item.get('state') or 'UNKNOWN',
+            }
+    return machines
+
+
+def machine_state_text(probed) -> str:
+    if not probed:
+        return 'MISSING'
+    return probed.get('state') or 'UNKNOWN'
+
+
+def is_ready_state(state_text: str) -> bool:
+    return state_text.upper() in READY_STATES
+
+
+def resolve_machine(state: dict, config: dict, name: str, explicit_zone: str | None = None):
+    machine = get_machine(state, name)
+    if explicit_zone:
+        if machine:
+            machine = {**machine, 'zone': explicit_zone}
+        else:
+            machine = {'name': name, 'zone': explicit_zone, 'type': '', 'mode': '', 'note': ''}
+        return machine
+    if machine:
+        return machine
+    found = probe_machine_across_zones(config, name)
+    if not found:
+        return None
+    if len(found) > 1:
+        zones = ', '.join(zone for zone, _ in found)
+        raise CommandError(f"TPU '{name}' found in multiple zones: {zones}. Use --zone to specify.")
+    zone, info = found[0]
+    return {
+        'name': name,
+        'zone': zone,
+        'type': info.get('acceleratorType', ''),
+        'mode': '',
+        'note': '',
+    }
+
+
+def wait_for_ssh(name: str, zone: str, timeout: int = 600) -> None:
+    start = time.time()
+    while time.time() - start < timeout:
+        result = gcloud('compute', 'tpus', 'tpu-vm', 'ssh', name, f'--zone={zone}', '--', 'true', check=False)
+        if result.returncode == 0:
+            return
+        time.sleep(5)
+    raise CommandError(f"Timed out waiting for '{name}' to accept SSH")
+
+
+def ssh_zone_args(name: str, state: dict, config: dict, rest: list[str]):
+    zone = None
+    passthrough = []
+    i = 0
+    while i < len(rest):
+        token = rest[i]
+        if token == '--':
+            passthrough = rest[i + 1:]
+            break
+        if token == '--zone':
+            if i + 1 >= len(rest):
+                raise UsageError('Usage: tpus ssh <name> [--zone <zone>] [-- extra-args]')
+            zone = rest[i + 1]
+            i += 2
+            continue
+        passthrough = rest[i:]
+        break
+    machine = resolve_machine(state, config, name, zone)
+    if not machine:
+        raise CommandError(f"TPU '{name}' not found in local state or configured zones.")
+    return machine['zone'], passthrough
+
+
+def remote_path(name: str, path: str) -> str:
+    return f'{name}:{path[1:]}' if path.startswith(':') else path
+
+
+def matching_grant_slots(config: dict, accel_type: str, zone: str | None, mode: str | None):
+    generation, chips = split_type(accel_type)
+    defaults = config.get('defaults', {})
+    desired_zone = zone or defaults.get('zone')
+    desired_mode = mode or defaults.get('mode', 'spot')
+    slots = []
+    for slot in config.get('grant_slots', []):
+        slot_generation = slot.get('generation') or derive_generation(slot.get('type', ''))
+        slot_zone = slot.get('zone')
+        slot_mode = slot.get('mode', defaults.get('mode', 'spot'))
+        max_chips = slot.get('max_chips') or slot.get('chips')
+        if not slot_generation or not slot_zone or max_chips is None:
+            continue
+        if slot_generation != generation:
+            continue
+        if desired_zone and slot_zone != desired_zone:
+            continue
+        if desired_mode and slot_mode != desired_mode:
+            continue
+        if chips > int(max_chips):
+            continue
+        slots.append({
+            'generation': slot_generation,
+            'zone': slot_zone,
+            'mode': slot_mode,
+            'max_chips': int(max_chips),
+        })
+    return slots
+
+
+def ensure_request_allowed(config: dict, accel_type: str, zone: str | None, mode: str | None):
+    slots = matching_grant_slots(config, accel_type, zone, mode)
+    if slots:
+        return slots
+    generation, chips = split_type(accel_type)
+    wanted_zone = zone or config.get('defaults', {}).get('zone') or '<unset>'
+    wanted_mode = mode or config.get('defaults', {}).get('mode', 'spot')
+    raise CommandError(
+        f"Request '{accel_type}' in zone {wanted_zone} mode {wanted_mode} is outside configured grant_slots for generation {generation} and {chips} chips."
+    )
+
+
+def candidate_specs(config: dict, accel_type: str | None, zone: str | None, mode: str | None, cycle: bool):
+    full_type = ensure_full_type(config, accel_type)
+    allowed_slots = ensure_request_allowed(config, full_type, zone, mode)
+    if not cycle:
+        chosen_zone = zone or config.get('defaults', {}).get('zone')
+        chosen_mode = mode or config.get('defaults', {}).get('mode', 'spot')
+        if not chosen_zone:
+            raise CommandError('No zone provided and defaults.zone is not set in config.json')
+        return [(full_type, chosen_zone, chosen_mode)]
+
+    return [(full_type, slot['zone'], slot['mode']) for slot in allowed_slots]
+
+
+def create_machine(state: dict, config: dict, name: str, accel_type: str | None, zone: str | None, *, mode: str | None, cycle: bool, auto_setup: bool, auto_ssh: bool):
+    if get_machine(state, name):
+        raise CommandError(f"TPU '{name}' is already tracked. Remove it first with: tpus rm {name}")
+    candidates = candidate_specs(config, accel_type, zone, mode, cycle)
+    service_account = config.get('service_account')
+    for try_type, try_zone, try_mode in candidates:
+        runtime = runtime_for_type(config, try_type)
+        cmd = [
+            'compute', 'tpus', 'tpu-vm', 'create', name,
+            f'--zone={try_zone}',
+            f'--accelerator-type={try_type}',
+            f'--version={runtime}',
+            f'--service-account={service_account}',
+            f'--metadata=startup-script={STARTUP_SCRIPT}',
+        ]
+        if try_mode == 'spot':
+            cmd.append('--spot')
+        print(f"Attempting to add '{name}' - type: {try_type}, zone: {try_zone}, mode: {try_mode}, runtime: {runtime}")
+        result = gcloud(*cmd, check=False)
+        if result.returncode != 0:
+            if cycle:
+                print('Failed, trying next...')
+                continue
+            raise CommandError(f"Failed to create '{name}'")
+
+        machine = {
+            'name': name,
+            'zone': try_zone,
+            'type': try_type,
+            'mode': try_mode,
+            'note': '',
+            'created_at': now_iso(),
+            'setup_complete': False,
+        }
+        set_machine(state, machine)
+        save_state(state)
+        print('\a', end='')
+        print(f"Created '{name}' in {try_zone}.")
+        if auto_setup or auto_ssh:
+            print(f"Waiting for '{name}' to accept SSH...")
+            wait_for_ssh(name, try_zone)
+        if auto_setup:
+            setup_machine(state, config, name)
+        if auto_ssh:
+            cmd_ssh([name])
+        return machine
+    raise CommandError(f"All candidate zones failed for '{name}'.")
+
+
+def parse_add_args(args: list[str]):
+    zone = None
+    accel_type = None
+    mode = None
+    cycle = False
+    no_setup = False
+    suffix = None
+    name = None
+    i = 0
+    while i < len(args):
+        token = args[i]
+        if token == '--zone':
+            zone = args[i + 1]
+            i += 2
+        elif token == '--type':
+            accel_type = args[i + 1]
+            i += 2
+        elif token == '--spot':
+            mode = 'spot'
+            i += 1
+        elif token == '--on-demand':
+            mode = 'on-demand'
+            i += 1
+        elif token == '--cycle':
+            cycle = True
+            i += 1
+        elif token == '--no-setup':
+            no_setup = True
+            i += 1
+        elif token == '-n':
+            suffix = args[i + 1]
+            i += 2
+        elif token == '--help':
+            print_help('add')
+            raise SystemExit(0)
+        elif token.startswith('-'):
+            raise UsageError('Usage: tpus add <name> [-n <suffix>] [--zone <zone>] [--type <type>] [--spot|--on-demand] [--cycle] [--no-setup]')
+        else:
+            if name is not None:
+                raise UsageError('Usage: tpus add <name> [-n <suffix>] [--zone <zone>] [--type <type>] [--spot|--on-demand] [--cycle] [--no-setup]')
+            name = token
+            i += 1
+    if not name:
+        raise UsageError('Usage: tpus add <name> [-n <suffix>] [--zone <zone>] [--type <type>] [--spot|--on-demand] [--cycle] [--no-setup]')
+    return normalize_tpu_name(parse_name_suffix(name, suffix)), zone, accel_type, mode, cycle, no_setup
+
+
+def parse_launch_range(spec: str) -> list[int]:
+    if '-' in spec:
+        start_s, end_s = spec.split('-', 1)
+        start = int(start_s)
+        end = int(end_s)
+        if end < start:
+            raise CommandError(f'Invalid launch range: {spec}')
+        return list(range(start, end + 1))
+    end = int(spec)
+    if end < 1:
+        raise CommandError(f'Invalid launch range: {spec}')
+    return list(range(1, end + 1))
+
+
+def print_table(headers: list[str], rows: list[list[str]]) -> None:
+    widths = [len(h) for h in headers]
+    for row in rows:
+        for i, value in enumerate(row):
+            widths[i] = max(widths[i], len(value))
+    fmt = '  '.join(f'{{:{w}}}' for w in widths)
+    print(fmt.format(*headers))
+    for row in rows:
+        print(fmt.format(*row))
+
+
+def list_status_rows(state: dict, config: dict, probe: bool, include_util: bool = False):
+    rows = []
+    remote = list_remote_machines(config) if probe else {}
+    names = sorted(set(state['machines']) | set(remote))
+    for name in names:
+        local_machine = state['machines'].get(name)
+        remote_machine = remote.get(name)
+        machine = dict(local_machine or {})
+        if remote_machine:
+            machine.setdefault('name', name)
+            machine['zone'] = remote_machine.get('zone', machine.get('zone', ''))
+            machine['type'] = remote_machine.get('type', machine.get('type', ''))
+        state_text = remote_machine.get('state', 'UNKNOWN') if probe and remote_machine else machine.get('last_seen_state', 'MISSING' if probe else 'UNKNOWN')
+        ready = 'yes' if is_ready_state(state_text) else 'no'
+        row = {
+            'name': name,
+            'type': machine.get('type', ''),
+            'mode': machine.get('mode', ''),
+            'zone': machine.get('zone', ''),
+            'state': state_text,
+            'ready': ready,
+            'note': machine.get('note', ''),
+            'tracked': 'yes' if local_machine else 'no',
+        }
+        if probe and remote_machine:
+            if not local_machine:
+                local_machine = {
+                    'name': name,
+                    'zone': remote_machine.get('zone', ''),
+                    'type': remote_machine.get('type', ''),
+                    'mode': machine.get('mode', ''),
+                    'note': machine.get('note', ''),
+                    'created_at': None,
+                    'setup_complete': False,
+                }
+                state['machines'][name] = local_machine
+            local_machine['last_seen_state'] = state_text
+            local_machine['zone'] = remote_machine.get('zone', local_machine.get('zone', ''))
+            if remote_machine.get('type'):
+                local_machine['type'] = remote_machine['type']
+        if include_util and is_ready_state(state_text) and row['zone']:
+            util_machine = {
+                'name': name,
+                'zone': row['zone'],
+            }
+            row.update(fetch_util(util_machine))
+        rows.append(row)
+    if probe:
+        state['last_full_probe_at'] = now_iso()
+        save_state(state)
+    return rows
+
+
+def fetch_util(machine: dict) -> dict:
+    remote = (
+        "export PATH=$HOME/.local/bin:$PATH\n"
+        "if ! command -v uvx >/dev/null 2>&1; then\n"
+        "  curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null 2>&1\n"
+        "  export PATH=$HOME/.local/bin:$PATH\n"
+        "fi\n"
+        "uvx tpu-info"
+    )
+    result = gcloud(
+        'compute', 'tpus', 'tpu-vm', 'ssh', machine['name'],
+        f"--zone={machine['zone']}", '--', remote,
+        check=False,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        return {'tpu': '?', 'hbm': '?', 'accel': '?'}
+
+    output = (result.stdout or '') + '\n' + (result.stderr or '')
+    duty_cycles = [float(m) for m in re.findall(r'(\d+(?:\.\d+)?)%', output)]
+    hbm_pairs = [
+        (float(used), float(total))
+        for used, total in re.findall(r'(\d+(?:\.\d+)?) GiB / (\d+(?:\.\d+)?) GiB', output)
+    ]
+    accel_match = re.search(r'Accelerator type:\s*([^\s]+)', output)
+
+    util = '?'
+    if duty_cycles:
+        util = f'{sum(duty_cycles) / len(duty_cycles):.0f}%'
+
+    hbm = '?'
+    if hbm_pairs:
+        used_sum = sum(used for used, _ in hbm_pairs)
+        total_sum = sum(total for _, total in hbm_pairs)
+        if total_sum > 0:
+            hbm = f'{(used_sum / total_sum) * 100:.0f}%'
+
+    return {
+        'tpu': util,
+        'hbm': hbm,
+        'accel': accel_match.group(1) if accel_match else machine.get('type', '?'),
+    }
+
+
+def setup_machine(state: dict, config: dict, name: str) -> None:
+    machine = resolve_machine(state, config, name)
+    if not machine:
+        raise CommandError(f"TPU '{name}' not found in local state or configured zones.")
+    zone = machine['zone']
+    print(f"Running init script on '{name}'...")
+    gcloud('compute', 'tpus', 'tpu-vm', 'ssh', name, f'--zone={zone}', '--', STARTUP_SCRIPT)
+    print(f"Setting BOX_NAME='{name}'...")
+    gcloud('compute', 'tpus', 'tpu-vm', 'ssh', name, f'--zone={zone}', '--', f"echo 'export BOX_NAME=\"{name}\"' >> ~/.bash_profile")
+    print(f"Installing uv on '{name}'...")
+    gcloud(
+        'compute', 'tpus', 'tpu-vm', 'ssh', name, f'--zone={zone}', '--',
+        "export PATH=$HOME/.local/bin:$PATH; command -v uvx >/dev/null 2>&1 || (curl -LsSf https://astral.sh/uv/install.sh | sh)"
+    )
+    machine['setup_complete'] = True
+    set_machine(state, machine)
+    save_state(state)
+    print('Done.')
+
+
+def print_help(subcommand: str | None = None) -> None:
+    if subcommand == 'add':
+        print('Usage: tpus add <name> [-n <suffix>] [--zone <zone>] [--type <type>] [--spot|--on-demand] [--cycle] [--no-setup]')
+        return
+    if subcommand == 'launch':
+        print('Usage: tpus launch <prefix> -n <N|A-B> [--zone <zone>] [--type <type>] [--spot|--on-demand] [--cycle]')
+        return
+    print(
+        'Usage: tpus <command> [args]\n\n'
+        '  add <name> [-n <suffix>] [--zone <z>] [--type <t>] [--spot|--on-demand] [--cycle] [--no-setup]\n'
+        '                                   Create a TPU VM and, by default, run setup then ssh.\n'
+        '  launch <prefix> -n <N|A-B> [--zone <z>] [--type <t>] [--spot|--on-demand] [--cycle]\n'
+        '                                   Batch-create numbered TPUs and auto-run setup.\n'
+        '  rm <name> [--zone <z>] | --all [--quiet] | --preempted [--probe]\n'
+        '  ls [--probe] [--ready]\n'
+        '  status [--probe] [--util]\n'
+        '  util [name]                        Utilization-focused view\n'
+        '  note <name> <text>                 Store a local note for a TPU\n'
+        '  setup <name>\n'
+        '  ssh <name> [--zone <z>] [-- extra-args]\n'
+        '  run <name> <command...>\n'
+        '  scp <name> <src> <dst> [flags]\n'
+        '  sync <name> <src> <dst> [rsync-flags...]\n'
+        '  config [edit]\n'
+        '  wipe\n'
+    )
+
+
+def cmd_add(args: list[str]) -> None:
+    state = load_state()
+    name, zone, accel_type, mode, cycle, no_setup = parse_add_args(args)
+    config = load_config()
+    create_machine(state, config, name, accel_type, zone, mode=mode, cycle=cycle, auto_setup=not no_setup, auto_ssh=not no_setup)
+
+
+def cmd_launch(args: list[str]) -> None:
+    state = load_state()
+    if not args or '--help' in args:
+        print_help('launch')
+        return
+    prefix = normalize_tpu_name(args[0])
+    zone = None
+    accel_type = None
+    mode = None
+    cycle = False
+    count_spec = None
+    i = 1
+    while i < len(args):
+        token = args[i]
+        if token == '-n':
+            count_spec = args[i + 1]
+            i += 2
+        elif token == '--zone':
+            zone = args[i + 1]
+            i += 2
+        elif token == '--type':
+            accel_type = args[i + 1]
+            i += 2
+        elif token == '--spot':
+            mode = 'spot'
+            i += 1
+        elif token == '--on-demand':
+            mode = 'on-demand'
+            i += 1
+        elif token == '--cycle':
+            cycle = True
+            i += 1
+        elif token == '--help':
+            print_help('launch')
+            return
+        else:
+            raise UsageError('Usage: tpus launch <prefix> -n <N|A-B> [--zone <zone>] [--type <type>] [--spot|--on-demand] [--cycle]')
+    if not count_spec:
+        raise UsageError('Usage: tpus launch <prefix> -n <N|A-B> [--zone <zone>] [--type <type>] [--spot|--on-demand] [--cycle]')
+    config = load_config()
+    failures = []
+    for idx in parse_launch_range(count_spec):
+        name = f'{prefix}-{idx}'
+        try:
+            create_machine(state, config, name, accel_type, zone, mode=mode, cycle=cycle, auto_setup=True, auto_ssh=False)
+        except CommandError as exc:
+            failures.append((name, str(exc)))
+    if failures:
+        for name, error in failures:
+            print(f'{name}: {error}', file=sys.stderr)
+        raise SystemExit(1)
+
+
+def cmd_rm(args: list[str]) -> None:
+    state = load_state()
+    zone = None
+    all_flag = False
+    quiet = False
+    preempted = False
+    probe = False
+    name = None
+    i = 0
+    while i < len(args):
+        token = args[i]
+        if token == '--all':
+            all_flag = True
+            i += 1
+        elif token == '--quiet':
+            quiet = True
+            i += 1
+        elif token == '--preempted':
+            preempted = True
+            i += 1
+        elif token == '--probe':
+            probe = True
+            i += 1
+        elif token == '--zone':
+            zone = args[i + 1]
+            i += 2
+        elif token == '--help':
+            print('Usage: tpus rm <name> [--zone <zone>] | tpus rm --all [--quiet] | tpus rm --preempted [--probe]')
+            return
+        elif token.startswith('-'):
+            raise UsageError('Usage: tpus rm <name> [--zone <zone>] | tpus rm --all [--quiet] | tpus rm --preempted [--probe]')
+        else:
+            if name is not None:
+                raise UsageError('Usage: tpus rm <name> [--zone <zone>] | tpus rm --all [--quiet] | tpus rm --preempted [--probe]')
+            name = token
+            i += 1
+    config = load_config()
+    if all_flag:
+        if name or preempted:
+            raise UsageError('Usage: tpus rm --all [--quiet]')
+        names = sorted(state['machines'])
+        if not names:
+            print('No TPUs tracked.')
+            return
+        if not quiet:
+            answer = input(f'Delete all {len(names)} tracked TPU(s)? [y/N] ')
+            if answer.lower() not in {'y', 'yes'}:
+                print('Aborted.')
+                return
+        failures = []
+        for machine_name in names:
+            machine = state['machines'][machine_name]
+            result = gcloud('compute', 'tpus', 'tpu-vm', 'delete', machine_name, f"--zone={machine['zone']}", check=False)
+            if result.returncode != 0:
+                failures.append(machine_name)
+                continue
+            remove_machine(state, machine_name)
+            print(f"Removed '{machine_name}'.")
+        save_state(state)
+        if failures:
+            raise CommandError(f'Failed to remove: {", ".join(failures)}')
+        return
+    if preempted:
+        removed = []
+        for machine_name in sorted(list(state['machines'])):
+            machine = state['machines'][machine_name]
+            found = []
+            if probe:
+                found = probe_machine_across_zones(config, machine_name)
+                probed = found[0][1] if len(found) == 1 else None
+            else:
+                probed = probe_machine(machine_name, machine['zone'])
+            state_text = machine_state_text(probed)
+            if not found and not probed:
+                remove_machine(state, machine_name)
+                removed.append(f'{machine_name} (missing)')
+                continue
+            if state_text.upper() in MISSING_STATES:
+                result = gcloud('compute', 'tpus', 'tpu-vm', 'delete', machine_name, f"--zone={machine['zone']}", check=False)
+                if result.returncode == 0 or probe_machine(machine_name, machine['zone']) is None:
+                    remove_machine(state, machine_name)
+                    removed.append(f'{machine_name} ({state_text})')
+        save_state(state)
+        if removed:
+            for entry in removed:
+                print(f'Removed {entry}.')
+        else:
+            print('No preempted TPUs found.')
+        return
+    if not name:
+        raise UsageError('Usage: tpus rm <name> [--zone <zone>] | tpus rm --all [--quiet] | tpus rm --preempted [--probe]')
+    machine = resolve_machine(state, config, name, zone)
+    if not machine:
+        raise CommandError(f"TPU '{name}' not found in local state or configured zones.")
+    delete = gcloud('compute', 'tpus', 'tpu-vm', 'delete', name, f"--zone={machine['zone']}", check=False)
+    if delete.returncode != 0 and probe_machine(name, machine['zone']) is not None:
+        raise CommandError(f"Failed to remove '{name}'")
+    remove_machine(state, name)
+    save_state(state)
+    print(f"Removed '{name}'.")
+
+
+def cmd_ls(args: list[str]) -> None:
+    state = load_state()
+    config = load_config(required=False)
+    explicit_probe = '--probe' in args
+    probe = explicit_probe or should_auto_probe(state)
+    ready_only = '--ready' in args
+    util = '--util' in args
+    if '--help' in args:
+        print('Usage: tpus ls [--probe] [--ready] [--util]')
+        return
+    if util:
+        cmd_util([])
+        return
+    if ready_only:
+        rows = list_status_rows(state, config, probe=True, include_util=False)
+        for row in rows:
+            if row['ready'] == 'yes':
+                print(row['name'])
+        return
+    rows = list_status_rows(state, config, probe=probe, include_util=False)
+    if not rows:
+        print('No TPUs tracked.')
+        return
+    table = [[row['name'], row['type'], row['mode'], row['zone'], row['state'], row['ready'], row['tracked']] for row in rows]
+    print_table(['NAME', 'TYPE', 'MODE', 'ZONE', 'STATE', 'READY', 'TRACKED'], table)
+
+
+def cmd_status(args: list[str]) -> None:
+    state = load_state()
+    config = load_config(required=False)
+    include_util = '--util' in args
+    explicit_probe = '--probe' in args or include_util
+    probe = explicit_probe or should_auto_probe(state)
+    if '--help' in args:
+        print('Usage: tpus status [--probe] [--util]')
+        return
+    rows = list_status_rows(state, config, probe=probe, include_util=include_util)
+    if not rows:
+        print('No TPUs tracked.')
+        return
+    if include_util:
+        table = [[row['name'], row['zone'], row.get('accel', row['type']), row['state'], row['ready'], row.get('tpu', '?'), row.get('hbm', '?'), row['tracked'], row['note']] for row in rows]
+        print_table(['NAME', 'ZONE', 'ACCEL', 'STATE', 'READY', 'TPU', 'HBM', 'TRACKED', 'NOTE'], table)
+    else:
+        table = [[row['name'], row['type'], row['mode'], row['zone'], row['state'], row['ready'], row['tracked'], row['note']] for row in rows]
+        print_table(['NAME', 'TYPE', 'MODE', 'ZONE', 'STATE', 'READY', 'TRACKED', 'NOTE'], table)
+
+
+def cmd_util(args: list[str]) -> None:
+    if '--help' in args:
+        print('Usage: tpus util [name]')
+        return
+    state = load_state()
+    config = load_config(required=False)
+    filtered_args = [arg for arg in args if arg != '--help']
+    target = filtered_args[0] if filtered_args else None
+    rows = list_status_rows(state, config, probe=True if should_auto_probe(state) else False, include_util=True)
+    if target:
+        rows = [row for row in rows if row['name'] == target]
+    if not rows:
+        print('No matching TPUs tracked.')
+        return
+    table = [[row['name'], row['zone'], row.get('accel', row['type']), row['state'], row['ready'], row.get('tpu', '?'), row.get('hbm', '?'), row['tracked'], row['note']] for row in rows]
+    print_table(['NAME', 'ZONE', 'ACCEL', 'STATE', 'READY', 'TPU', 'HBM', 'TRACKED', 'NOTE'], table)
+
+
+def cmd_note(args: list[str]) -> None:
+    if len(args) < 2:
+        raise UsageError('Usage: tpus note <name> <text>')
+    name = args[0]
+    note = ' '.join(args[1:]).strip()
+    state = load_state()
+    machine = get_machine(state, name)
+    if not machine:
+        machine = {'name': name, 'zone': '', 'type': '', 'mode': '', 'note': '', 'created_at': None, 'setup_complete': False}
+    machine['note'] = note
+    set_machine(state, machine)
+    save_state(state)
+    print(f"Updated note for '{name}'.")
+
+
+def cmd_setup(args: list[str]) -> None:
+    if len(args) != 1:
+        raise UsageError('Usage: tpus setup <name>')
+    state = load_state()
+    config = load_config()
+    setup_machine(state, config, args[0])
+
+
+def cmd_ssh(args: list[str]) -> None:
+    if not args:
+        raise UsageError('Usage: tpus ssh <name> [--zone <zone>] [-- extra-args]')
+    name = args[0]
+    state = load_state()
+    config = load_config(required=False)
+    zone, passthrough = ssh_zone_args(name, state, config, args[1:])
+    gcloud('compute', 'tpus', 'tpu-vm', 'ssh', name, f'--zone={zone}', *passthrough)
+
+
+def cmd_run(args: list[str]) -> None:
+    if len(args) < 2:
+        raise UsageError('Usage: tpus run <name> <command...>')
+    name = args[0]
+    command = ' '.join(args[1:])
+    state = load_state()
+    config = load_config(required=False)
+    machine = resolve_machine(state, config, name)
+    if not machine:
+        raise CommandError(f"TPU '{name}' not found in local state or configured zones.")
+    gcloud('compute', 'tpus', 'tpu-vm', 'ssh', name, f"--zone={machine['zone']}", '--', command)
+
+
+def cmd_scp(args: list[str]) -> None:
+    if len(args) < 3:
+        raise UsageError('Usage: tpus scp <name> <src> <dst> [flags]')
+    name, src, dst, *extra = args
+    state = load_state()
+    config = load_config(required=False)
+    machine = resolve_machine(state, config, name)
+    if not machine:
+        raise CommandError(f"TPU '{name}' not found in local state or configured zones.")
+    gcloud(
+        'compute', 'tpus', 'tpu-vm', 'scp',
+        f'--zone={machine["zone"]}',
+        remote_path(name, src),
+        remote_path(name, dst),
+        *extra,
+    )
+
+
+def cmd_sync(args: list[str]) -> None:
+    if len(args) < 3:
+        raise UsageError('Usage: tpus sync <name> <src> <dst> [rsync-flags...]')
+    name, src, dst, *extra = args
+    state = load_state()
+    config = load_config(required=False)
+    machine = resolve_machine(state, config, name)
+    if not machine:
+        raise CommandError(f"TPU '{name}' not found in local state or configured zones.")
+    src = remote_path(name, src)
+    dst = remote_path(name, dst)
+    rsh = f"bash -c 'shift; exec gcloud compute tpus tpu-vm ssh {shlex.quote(name)} --zone={shlex.quote(machine['zone'])} -- \"$@\"' --"
+    run(['rsync', '-e', rsh, src, dst, *extra])
+
+
+def cmd_config(args: list[str]) -> None:
+    ensure_dir()
+    if args[:1] == ['edit']:
+        subprocess.run([editor(), str(TPUS_CONFIG)], check=False)
+        return
+    if TPUS_CONFIG.exists():
+        print_json(read_json(TPUS_CONFIG, {}))
+    else:
+        print(f'No config found at {TPUS_CONFIG}')
+
+
+def cmd_wipe(args: list[str]) -> None:
+    removed = False
+    for path in (TPUS_STATE_JSON, TPUS_STATE_TSV):
+        if path.exists():
+            path.unlink()
+            print(f'Removed {path}')
+            removed = True
+    if not removed:
+        print('Nothing to wipe.')
+
+
+def main(argv: list[str]) -> int:
+    if not argv or argv[0] in {'help', '--help', '-h'}:
+        print_help()
+        return 0
+    command, args = argv[0], argv[1:]
+    dispatch = {
+        'add': cmd_add,
+        'launch': cmd_launch,
+        'rm': cmd_rm,
+        'ls': cmd_ls,
+        'status': cmd_status,
+        'util': cmd_util,
+        'note': cmd_note,
+        'setup': cmd_setup,
+        'ssh': cmd_ssh,
+        'run': cmd_run,
+        'scp': cmd_scp,
+        'sync': cmd_sync,
+        'config': cmd_config,
+        'wipe': cmd_wipe,
+    }
+    if command not in dispatch:
+        print(f"Unknown command: '{command}'. Run 'tpus help'.", file=sys.stderr)
+        return 1
+    try:
+        dispatch[command](args)
+        return 0
+    except UsageError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    except CommandError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+
+if __name__ == '__main__':
+    raise SystemExit(main(sys.argv[1:]))
