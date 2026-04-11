@@ -18,6 +18,18 @@ alias fpid="ps aux | fzf -m | awk '{print \$2}'" # find pid
 # Trim new lines and copy to clipboard
 alias c="tr -d '\n' | pbcopy"
 
+# Copy to clipboard via OSC 52 — works over SSH/tmux unlike pbcopy.
+# Requires `set -g set-clipboard on` in tmux.conf. Size-limited by the terminal.
+copy() {
+  local b64
+  if [ -t 0 ]; then
+    b64=$(printf '%s' "$*" | base64 | tr -d '\n')
+  else
+    b64=$(base64 | tr -d '\n')
+  fi
+  printf '\033]52;c;%s\a' "$b64" > /dev/tty
+}
+
 # Join all files in a dir into one output with [filename]: delimiters
 joindir() {
   local dir="${1:-.}"
