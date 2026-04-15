@@ -5,6 +5,7 @@ alias d='cd ~/Documents'
 alias v="vim"
 alias df="df -h"
 alias mkdir="mkdir -p"
+alias fd=fdfind
 
 alias count="ls -1 | wc -l"			        # no. of things
 alias countf="ls -p | grep -v / | wc -l"	# no. of files
