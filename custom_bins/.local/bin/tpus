@@ -106,7 +106,9 @@ def should_auto_probe(state: dict) -> bool:
     # PROVISIONING) — these are not settled and the cache is immediately stale.
     for machine in state.get('machines', {}).values():
         cached = machine.get('last_seen_state', '').upper()
-        if cached and cached not in READY_STATES and cached not in MISSING_STATES:
+        if not cached:  # freshly added, never probed
+            return True
+        if cached not in READY_STATES and cached not in MISSING_STATES:
             return True
     last_probe = parse_iso(state.get('last_full_probe_at'))
     if last_probe is None:
@@ -630,9 +632,9 @@ def print_table(headers: list[str], rows: list[list[str]]) -> None:
         print(sep.join(parts))
 
 
-def list_status_rows(state: dict, config: dict, probe: bool, include_util: bool = False, debug: bool = False, quiet: bool = False):
+def list_status_rows(state: dict, config: dict, probe: bool, include_util: bool = False, debug: bool = False, verbose: bool = False):
     rows = []
-    if probe and not quiet:
+    if probe and verbose:
         eprint('Probing zones…')
     remote = list_remote_machines(config, debug=debug) if probe else {}
     if debug and probe:
@@ -715,14 +717,17 @@ def fetch_util(machine: dict) -> dict:
 
     output = (result.stdout or '') + '\n' + (result.stderr or '')
 
-    # Each table row looks like: | <chip> | <hbm> | <duty%> |
-    # When no framework is loaded, tpu-info prints N/A for both — treat as idle (0%).
+    # Parse only rows from the "TPU Runtime Utilization" table.
+    # The duty cycle column always contains either a '%' or 'N/A'; other tables
+    # (e.g. "TPU Chips") have unrelated numeric columns that would pollute the average.
     chip_rows = re.findall(r'\|\s*\d+\s*\|([^|]+)\|([^|]+)\|', output)
     duty_cycles: list[float] = []
     hbm_pairs: list[tuple[float, float]] = []
     for hbm_col, duty_col in chip_rows:
         duty_col = duty_col.strip()
         hbm_col = hbm_col.strip()
+        if '%' not in duty_col and 'N/A' not in duty_col:
+            continue  # not a utilization row
         m = re.search(r'(\d+(?:\.\d+)?)%', duty_col)
         duty_cycles.append(float(m.group(1)) if m else 0.0)
         hbm_m = re.search(r'(\d+(?:\.\d+)?)\s*GiB\s*/\s*(\d+(?:\.\d+)?)\s*GiB', hbm_col)
@@ -1016,17 +1021,17 @@ def cmd_ls(args: list[str]) -> None:
         cmd_util([])
         return
     if ready_only:
-        rows = list_status_rows(state, config, probe=True, include_util=False, debug=debug, quiet=True)
+        rows = list_status_rows(state, config, probe=True, include_util=False, debug=debug, verbose=False)
         for row in rows:
             if row['ready'] == 'yes':
                 print(row['name'])
         return
-    rows = list_status_rows(state, config, probe=probe, include_util=False, debug=debug)
+    rows = list_status_rows(state, config, probe=probe, include_util=False, debug=debug, verbose=explicit_probe)
     if not rows:
         print('No TPUs tracked.')
         return
-    table = [[row['name'], row['type'], row['mode'], row['zone'], fmt_state(row['state']), fmt_ready(row['ready'])] for row in rows]
-    print_table(['NAME', 'TYPE', 'MODE', 'ZONE', 'STATE', 'READY'], table)
+    table = [[row['name'], row['type'], row['mode'], row['zone'], fmt_state(row['state'])] for row in rows]
+    print_table(['NAME', 'TYPE', 'MODE', 'ZONE', 'STATE'], table)
 
 
 def cmd_status(args: list[str]) -> None:
@@ -1039,16 +1044,16 @@ def cmd_status(args: list[str]) -> None:
     if '--help' in args:
         print('Usage: tpus status [--probe] [--util] [--debug]')
         return
-    rows = list_status_rows(state, config, probe=probe, include_util=include_util, debug=debug)
+    rows = list_status_rows(state, config, probe=probe, include_util=include_util, debug=debug, verbose=explicit_probe)
     if not rows:
         print('No TPUs tracked.')
         return
     if include_util:
-        table = [[row['name'], row['zone'], row.get('accel', row['type']), fmt_state(row['state']), fmt_ready(row['ready']), row.get('tpu', '?'), row['note']] for row in rows]
-        print_table(['NAME', 'ZONE', 'ACCEL', 'STATE', 'READY', 'UTIL', 'NOTE'], table)
+        table = [[row['name'], row['zone'], row.get('accel', row['type']), fmt_state(row['state']), row.get('tpu', '?'), row['note']] for row in rows]
+        print_table(['NAME', 'ZONE', 'ACCEL', 'STATE', 'UTIL', 'NOTE'], table)
     else:
-        table = [[row['name'], row['type'], row['mode'], row['zone'], fmt_state(row['state']), fmt_ready(row['ready']), row['note']] for row in rows]
-        print_table(['NAME', 'TYPE', 'MODE', 'ZONE', 'STATE', 'READY', 'NOTE'], table)
+        table = [[row['name'], row['type'], row['mode'], row['zone'], fmt_state(row['state']), row['note']] for row in rows]
+        print_table(['NAME', 'TYPE', 'MODE', 'ZONE', 'STATE', 'NOTE'], table)
 
 
 def cmd_util(args: list[str]) -> None:
@@ -1066,8 +1071,8 @@ def cmd_util(args: list[str]) -> None:
     if not rows:
         print('No matching TPUs tracked.')
         return
-    table = [[row['name'], row['zone'], row.get('accel', row['type']), fmt_state(row['state']), fmt_ready(row['ready']), row.get('tpu', '?'), row['note']] for row in rows]
-    print_table(['NAME', 'ZONE', 'ACCEL', 'STATE', 'READY', 'UTIL', 'NOTE'], table)
+    table = [[row['name'], row['zone'], row.get('accel', row['type']), fmt_state(row['state']), row.get('tpu', '?'), row['note']] for row in rows]
+    print_table(['NAME', 'ZONE', 'ACCEL', 'STATE', 'UTIL', 'NOTE'], table)
 
 
 def cmd_note(args: list[str]) -> None:
