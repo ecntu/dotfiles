@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
+import concurrent.futures
 import json
 import os
+import random
 import re
 import shlex
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,6 +20,64 @@ STARTUP_SCRIPT = 'curl -fsSL https://stuff.ecntu.com/init.sh | bash'
 READY_STATES = {'READY', 'RUNNING', 'ACTIVE', 'HEALTHY'}
 MISSING_STATES = {'PREEMPTED', 'TERMINATED', 'STOPPED', 'UNKNOWN', 'MISSING'}
 FULL_PROBE_TTL_SECONDS = 3600
+
+# ── colour ────────────────────────────────────────────────────────────────────
+_COLOR_MODE = 'auto'
+_ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
+
+
+def _stdout_supports_color() -> bool:
+    if os.environ.get('NO_COLOR'):
+        return False
+    if os.environ.get('FORCE_COLOR') or os.environ.get('CLICOLOR_FORCE'):
+        return True
+    return sys.stdout.isatty() and os.environ.get('TERM', '') != 'dumb'
+
+
+def _use_color() -> bool:
+    if _COLOR_MODE == 'always':
+        return True
+    if _COLOR_MODE == 'never':
+        return False
+    return _stdout_supports_color()
+
+
+def _c(*codes: int) -> str:
+    return f'\033[{";".join(map(str, codes))}m' if _use_color() else ''
+
+
+RESET  = _c(0)
+BOLD   = _c(1)
+DIM    = _c(2)
+GREEN  = _c(32)
+YELLOW = _c(33)
+RED    = _c(31)
+
+
+def _vis(s: str) -> int:
+    """Visible (printable) length of a string, ignoring ANSI escape codes."""
+    return len(_ANSI_RE.sub('', s))
+
+
+def fmt_state(state_text: str) -> str:
+    s = state_text.upper()
+    if s in READY_STATES:
+        return f'{GREEN}{state_text}{RESET}'
+    if s in MISSING_STATES:
+        return f'{RED}{state_text}{RESET}'
+    return f'{YELLOW}{state_text}{RESET}'
+
+
+def fmt_ready(ready: str) -> str:
+    return f'{GREEN}{ready}{RESET}' if ready == 'yes' else f'{DIM}{ready}{RESET}'
+
+
+def eprint(msg: str) -> None:
+    """Print a dim status/progress line to stderr."""
+    print(f'{DIM}{msg}{RESET}', file=sys.stderr)
+
+# ─────────────────────────────────────────────────────────────────────────────
+_state_lock = threading.Lock()
 
 
 class UsageError(Exception):
@@ -41,6 +102,12 @@ def parse_iso(ts: str | None):
 
 
 def should_auto_probe(state: dict) -> bool:
+    # Always probe when any machine is in a transitional state (e.g. CREATING,
+    # PROVISIONING) — these are not settled and the cache is immediately stale.
+    for machine in state.get('machines', {}).values():
+        cached = machine.get('last_seen_state', '').upper()
+        if cached and cached not in READY_STATES and cached not in MISSING_STATES:
+            return True
     last_probe = parse_iso(state.get('last_full_probe_at'))
     if last_probe is None:
         return True
@@ -237,40 +304,60 @@ def probe_machine(name: str, zone: str):
 
 
 def probe_machine_across_zones(config: dict, name: str):
+    zones = configured_zones(config)
     found = []
-    for zone in configured_zones(config):
-        info = probe_machine(name, zone)
-        if info is not None:
-            found.append((zone, info))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(zones) or 1) as ex:
+        zone_futures = {ex.submit(probe_machine, name, zone): zone for zone in zones}
+        for fut in concurrent.futures.as_completed(zone_futures):
+            zone = zone_futures[fut]
+            info = fut.result()
+            if info is not None:
+                found.append((zone, info))
     return found
 
 
-def list_remote_machines(config: dict):
+def _query_zone(zone: str, debug: bool) -> tuple[str, list]:
+    result = gcloud(
+        'compute', 'tpus', 'tpu-vm', 'list',
+        f'--zone={zone}',
+        '--format=json(name,state,acceleratorType)',
+        check=False,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        if debug:
+            eprint(f'[debug] zone {zone}: gcloud error rc={result.returncode} stderr={result.stderr.strip()!r}')
+        return zone, []
+    try:
+        payload = json.loads(result.stdout or '[]')
+    except json.JSONDecodeError:
+        if debug:
+            eprint(f'[debug] zone {zone}: JSON parse error stdout={result.stdout!r}')
+        return zone, []
+    if debug:
+        eprint(f'[debug] zone {zone}: found {len(payload)} TPU(s): {[item.get("name","?") + "=" + (item.get("state") or "?") for item in payload]}')
+    return zone, payload
+
+
+def list_remote_machines(config: dict, debug: bool = False):
+    zones = configured_zones(config)
+    if debug:
+        eprint(f'[debug] querying zones: {zones}')
     machines = {}
-    for zone in configured_zones(config):
-        result = gcloud(
-            'compute', 'tpus', 'tpu-vm', 'list',
-            f'--zone={zone}',
-            '--format=json(name,state,acceleratorType)',
-            check=False,
-            capture_output=True,
-        )
-        if result.returncode != 0:
-            continue
-        try:
-            payload = json.loads(result.stdout or '[]')
-        except json.JSONDecodeError:
-            continue
-        for item in payload:
-            name = normalize_tpu_name(item.get('name', ''))
-            if not name:
-                continue
-            machines[name] = {
-                'name': name,
-                'zone': zone,
-                'type': item.get('acceleratorType', ''),
-                'state': item.get('state') or 'UNKNOWN',
-            }
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(zones) or 1) as ex:
+        zone_futures = {ex.submit(_query_zone, zone, debug): zone for zone in zones}
+        for fut in concurrent.futures.as_completed(zone_futures):
+            zone, payload = fut.result()
+            for item in payload:
+                name = normalize_tpu_name(item.get('name', ''))
+                if not name:
+                    continue
+                machines[name] = {
+                    'name': name,
+                    'zone': zone,
+                    'type': item.get('acceleratorType', ''),
+                    'state': item.get('state') or 'UNKNOWN',
+                }
     return machines
 
 
@@ -315,8 +402,12 @@ def wait_for_ssh(name: str, zone: str, timeout: int = 600) -> None:
     while time.time() - start < timeout:
         result = gcloud('compute', 'tpus', 'tpu-vm', 'ssh', name, f'--zone={zone}', '--', 'true', check=False)
         if result.returncode == 0:
+            print()
             return
+        elapsed = int(time.time() - start)
+        print(f'\r{DIM}Waiting for SSH ({elapsed}s elapsed)…{RESET}   ', end='', flush=True)
         time.sleep(5)
+    print()
     raise CommandError(f"Timed out waiting for '{name}' to accept SSH")
 
 
@@ -350,7 +441,7 @@ def remote_path(name: str, path: str) -> str:
 def matching_grant_slots(config: dict, accel_type: str, zone: str | None, mode: str | None):
     generation, chips = split_type(accel_type)
     defaults = config.get('defaults', {})
-    desired_zone = zone or defaults.get('zone')
+    desired_zone = zone
     desired_mode = mode or defaults.get('mode', 'spot')
     slots = []
     for slot in config.get('grant_slots', []):
@@ -389,7 +480,7 @@ def ensure_request_allowed(config: dict, accel_type: str, zone: str | None, mode
     )
 
 
-def candidate_specs(config: dict, accel_type: str | None, zone: str | None, mode: str | None, cycle: bool):
+def candidate_specs(config: dict, accel_type: str | None, zone: str | None, mode: str | None, cycle: bool, shuffle: bool = False):
     full_type = ensure_full_type(config, accel_type)
     allowed_slots = ensure_request_allowed(config, full_type, zone, mode)
     if not cycle:
@@ -399,13 +490,16 @@ def candidate_specs(config: dict, accel_type: str | None, zone: str | None, mode
             raise CommandError('No zone provided and defaults.zone is not set in config.json')
         return [(full_type, chosen_zone, chosen_mode)]
 
-    return [(full_type, slot['zone'], slot['mode']) for slot in allowed_slots]
+    slots = list(allowed_slots)
+    if shuffle:
+        random.shuffle(slots)
+    return [(full_type, slot['zone'], slot['mode']) for slot in slots]
 
 
-def create_machine(state: dict, config: dict, name: str, accel_type: str | None, zone: str | None, *, mode: str | None, cycle: bool, auto_setup: bool, auto_ssh: bool):
+def create_machine(state: dict, config: dict, name: str, accel_type: str | None, zone: str | None, *, mode: str | None, cycle: bool, shuffle: bool = False, auto_setup: bool, auto_ssh: bool):
     if get_machine(state, name):
         raise CommandError(f"TPU '{name}' is already tracked. Remove it first with: tpus rm {name}")
-    candidates = candidate_specs(config, accel_type, zone, mode, cycle)
+    candidates = candidate_specs(config, accel_type, zone, mode, cycle, shuffle=shuffle)
     service_account = config.get('service_account')
     for try_type, try_zone, try_mode in candidates:
         runtime = runtime_for_type(config, try_type)
@@ -419,11 +513,11 @@ def create_machine(state: dict, config: dict, name: str, accel_type: str | None,
         ]
         if try_mode == 'spot':
             cmd.append('--spot')
-        print(f"Attempting to add '{name}' - type: {try_type}, zone: {try_zone}, mode: {try_mode}, runtime: {runtime}")
+        eprint(f"Creating '{name}'  type={try_type}  zone={try_zone}  mode={try_mode}  runtime={runtime}")
         result = gcloud(*cmd, check=False)
         if result.returncode != 0:
             if cycle:
-                print('Failed, trying next...')
+                eprint('Failed, trying next candidate…')
                 continue
             raise CommandError(f"Failed to create '{name}'")
 
@@ -436,10 +530,11 @@ def create_machine(state: dict, config: dict, name: str, accel_type: str | None,
             'created_at': now_iso(),
             'setup_complete': False,
         }
-        set_machine(state, machine)
-        save_state(state)
-        print('\a', end='')
-        print(f"Created '{name}' in {try_zone}.")
+        with _state_lock:
+            set_machine(state, machine)
+            save_state(state)
+        print('\a', end='', flush=True)
+        print(f"{GREEN}Created{RESET} '{name}' in {try_zone}.")
         if auto_setup or auto_ssh:
             print(f"Waiting for '{name}' to accept SSH...")
             wait_for_ssh(name, try_zone)
@@ -456,6 +551,7 @@ def parse_add_args(args: list[str]):
     accel_type = None
     mode = None
     cycle = False
+    shuffle = False
     no_setup = False
     suffix = None
     name = None
@@ -477,6 +573,9 @@ def parse_add_args(args: list[str]):
         elif token == '--cycle':
             cycle = True
             i += 1
+        elif token == '--shuffle':
+            shuffle = True
+            i += 1
         elif token == '--no-setup':
             no_setup = True
             i += 1
@@ -487,15 +586,15 @@ def parse_add_args(args: list[str]):
             print_help('add')
             raise SystemExit(0)
         elif token.startswith('-'):
-            raise UsageError('Usage: tpus add <name> [-n <suffix>] [--zone <zone>] [--type <type>] [--spot|--on-demand] [--cycle] [--no-setup]')
+            raise UsageError('Usage: tpus add <name> [-n <suffix>] [--zone <zone>] [--type <type>] [--spot|--on-demand] [--cycle] [--shuffle] [--no-setup]')
         else:
             if name is not None:
-                raise UsageError('Usage: tpus add <name> [-n <suffix>] [--zone <zone>] [--type <type>] [--spot|--on-demand] [--cycle] [--no-setup]')
+                raise UsageError('Usage: tpus add <name> [-n <suffix>] [--zone <zone>] [--type <type>] [--spot|--on-demand] [--cycle] [--shuffle] [--no-setup]')
             name = token
             i += 1
     if not name:
-        raise UsageError('Usage: tpus add <name> [-n <suffix>] [--zone <zone>] [--type <type>] [--spot|--on-demand] [--cycle] [--no-setup]')
-    return normalize_tpu_name(parse_name_suffix(name, suffix)), zone, accel_type, mode, cycle, no_setup
+        raise UsageError('Usage: tpus add <name> [-n <suffix>] [--zone <zone>] [--type <type>] [--spot|--on-demand] [--cycle] [--shuffle] [--no-setup]')
+    return normalize_tpu_name(parse_name_suffix(name, suffix)), zone, accel_type, mode, cycle, shuffle, no_setup
 
 
 def parse_launch_range(spec: str) -> list[int]:
@@ -513,19 +612,32 @@ def parse_launch_range(spec: str) -> list[int]:
 
 
 def print_table(headers: list[str], rows: list[list[str]]) -> None:
+    if not rows:
+        return
     widths = [len(h) for h in headers]
     for row in rows:
         for i, value in enumerate(row):
-            widths[i] = max(widths[i], len(value))
-    fmt = '  '.join(f'{{:{w}}}' for w in widths)
-    print(fmt.format(*headers))
+            widths[i] = max(widths[i], _vis(str(value)))
+    sep = '  '
+    # bold header
+    hdr = sep.join(f'{BOLD}{h}{RESET}' + ' ' * (w - len(h)) for h, w in zip(headers, widths))
+    print(hdr)
+    # separator
+    print(DIM + sep.join('─' * w for w in widths) + RESET)
+    # rows – values may contain ANSI codes, use _vis for padding
     for row in rows:
-        print(fmt.format(*row))
+        parts = [str(v) + ' ' * (w - _vis(str(v))) for v, w in zip(row, widths)]
+        print(sep.join(parts))
 
 
-def list_status_rows(state: dict, config: dict, probe: bool, include_util: bool = False):
+def list_status_rows(state: dict, config: dict, probe: bool, include_util: bool = False, debug: bool = False, quiet: bool = False):
     rows = []
-    remote = list_remote_machines(config) if probe else {}
+    if probe and not quiet:
+        eprint('Probing zones…')
+    remote = list_remote_machines(config, debug=debug) if probe else {}
+    if debug and probe:
+        eprint(f'[debug] local state has {len(state["machines"])} machine(s): {sorted(state["machines"])}')
+        eprint(f'[debug] remote found {len(remote)} machine(s): {sorted(remote)}')
     names = sorted(set(state['machines']) | set(remote))
     for name in names:
         local_machine = state['machines'].get(name)
@@ -535,7 +647,12 @@ def list_status_rows(state: dict, config: dict, probe: bool, include_util: bool 
             machine.setdefault('name', name)
             machine['zone'] = remote_machine.get('zone', machine.get('zone', ''))
             machine['type'] = remote_machine.get('type', machine.get('type', ''))
-        state_text = remote_machine.get('state', 'UNKNOWN') if probe and remote_machine else machine.get('last_seen_state', 'MISSING' if probe else 'UNKNOWN')
+        if probe:
+            state_text = remote_machine.get('state', 'UNKNOWN') if remote_machine else 'MISSING'
+        else:
+            state_text = machine.get('last_seen_state', 'UNKNOWN')
+        if debug:
+            eprint(f'[debug] {name}: remote={remote_machine is not None} last_seen_state={machine.get("last_seen_state")!r} → resolved={state_text!r}')
         ready = 'yes' if is_ready_state(state_text) else 'no'
         row = {
             'name': name,
@@ -563,6 +680,8 @@ def list_status_rows(state: dict, config: dict, probe: bool, include_util: bool 
             local_machine['zone'] = remote_machine.get('zone', local_machine.get('zone', ''))
             if remote_machine.get('type'):
                 local_machine['type'] = remote_machine['type']
+        elif probe and local_machine:
+            local_machine['last_seen_state'] = state_text  # e.g. 'MISSING'
         if include_util and is_ready_state(state_text) and row['zone']:
             util_machine = {
                 'name': name,
@@ -595,27 +714,27 @@ def fetch_util(machine: dict) -> dict:
         return {'tpu': '?', 'hbm': '?', 'accel': '?'}
 
     output = (result.stdout or '') + '\n' + (result.stderr or '')
-    duty_cycles = [float(m) for m in re.findall(r'(\d+(?:\.\d+)?)%', output)]
-    hbm_pairs = [
-        (float(used), float(total))
-        for used, total in re.findall(r'(\d+(?:\.\d+)?) GiB / (\d+(?:\.\d+)?) GiB', output)
-    ]
+
+    # Each table row looks like: | <chip> | <hbm> | <duty%> |
+    # When no framework is loaded, tpu-info prints N/A for both — treat as idle (0%).
+    chip_rows = re.findall(r'\|\s*\d+\s*\|([^|]+)\|([^|]+)\|', output)
+    duty_cycles: list[float] = []
+    hbm_pairs: list[tuple[float, float]] = []
+    for hbm_col, duty_col in chip_rows:
+        duty_col = duty_col.strip()
+        hbm_col = hbm_col.strip()
+        m = re.search(r'(\d+(?:\.\d+)?)%', duty_col)
+        duty_cycles.append(float(m.group(1)) if m else 0.0)
+        hbm_m = re.search(r'(\d+(?:\.\d+)?)\s*GiB\s*/\s*(\d+(?:\.\d+)?)\s*GiB', hbm_col)
+        if hbm_m:
+            hbm_pairs.append((float(hbm_m.group(1)), float(hbm_m.group(2))))
+
     accel_match = re.search(r'Accelerator type:\s*([^\s]+)', output)
 
-    util = '?'
-    if duty_cycles:
-        util = f'{sum(duty_cycles) / len(duty_cycles):.0f}%'
-
-    hbm = '?'
-    if hbm_pairs:
-        used_sum = sum(used for used, _ in hbm_pairs)
-        total_sum = sum(total for _, total in hbm_pairs)
-        if total_sum > 0:
-            hbm = f'{(used_sum / total_sum) * 100:.0f}%'
+    util = f'{sum(duty_cycles) / len(duty_cycles):.0f}%' if duty_cycles else '?'
 
     return {
         'tpu': util,
-        'hbm': hbm,
         'accel': accel_match.group(1) if accel_match else machine.get('type', '?'),
     }
 
@@ -635,8 +754,9 @@ def setup_machine(state: dict, config: dict, name: str) -> None:
         "export PATH=$HOME/.local/bin:$PATH; command -v uvx >/dev/null 2>&1 || (curl -LsSf https://astral.sh/uv/install.sh | sh)"
     )
     machine['setup_complete'] = True
-    set_machine(state, machine)
-    save_state(state)
+    with _state_lock:
+        set_machine(state, machine)
+        save_state(state)
     print('Done.')
 
 
@@ -648,7 +768,7 @@ def print_help(subcommand: str | None = None) -> None:
         print('Usage: tpus launch <prefix> -n <N|A-B> [--zone <zone>] [--type <type>] [--spot|--on-demand] [--cycle]')
         return
     print(
-        'Usage: tpus <command> [args]\n\n'
+        'Usage: tpus [--color=auto|always|never] <command> [args]\n\n'
         '  add <name> [-n <suffix>] [--zone <z>] [--type <t>] [--spot|--on-demand] [--cycle] [--no-setup]\n'
         '                                   Create a TPU VM and, by default, run setup then ssh.\n'
         '  launch <prefix> -n <N|A-B> [--zone <z>] [--type <t>] [--spot|--on-demand] [--cycle]\n'
@@ -668,11 +788,34 @@ def print_help(subcommand: str | None = None) -> None:
     )
 
 
+def parse_global_args(argv: list[str]) -> tuple[list[str], str]:
+    color_mode = 'auto'
+    args = list(argv)
+    while args:
+        token = args[0]
+        if token in {'--help', '-h', 'help'}:
+            break
+        if token.startswith('--color='):
+            value = token.split('=', 1)[1]
+        elif token == '--color':
+            if len(args) < 2:
+                raise UsageError('Usage: tpus [--color=auto|always|never] <command> [args]')
+            value = args[1]
+            args = [args[0], *args[2:]]
+        else:
+            break
+        if value not in {'auto', 'always', 'never'}:
+            raise UsageError("Invalid value for --color. Expected one of: auto, always, never.")
+        color_mode = value
+        args = args[1:]
+    return args, color_mode
+
+
 def cmd_add(args: list[str]) -> None:
     state = load_state()
-    name, zone, accel_type, mode, cycle, no_setup = parse_add_args(args)
+    name, zone, accel_type, mode, cycle, shuffle, no_setup = parse_add_args(args)
     config = load_config()
-    create_machine(state, config, name, accel_type, zone, mode=mode, cycle=cycle, auto_setup=not no_setup, auto_ssh=not no_setup)
+    create_machine(state, config, name, accel_type, zone, mode=mode, cycle=cycle, shuffle=shuffle, auto_setup=not no_setup, auto_ssh=not no_setup)
 
 
 def cmd_launch(args: list[str]) -> None:
@@ -685,6 +828,7 @@ def cmd_launch(args: list[str]) -> None:
     accel_type = None
     mode = None
     cycle = False
+    shuffle = False
     count_spec = None
     i = 1
     while i < len(args):
@@ -707,21 +851,32 @@ def cmd_launch(args: list[str]) -> None:
         elif token == '--cycle':
             cycle = True
             i += 1
+        elif token == '--shuffle':
+            shuffle = True
+            i += 1
         elif token == '--help':
             print_help('launch')
             return
         else:
-            raise UsageError('Usage: tpus launch <prefix> -n <N|A-B> [--zone <zone>] [--type <type>] [--spot|--on-demand] [--cycle]')
+            raise UsageError('Usage: tpus launch <prefix> -n <N|A-B> [--zone <zone>] [--type <type>] [--spot|--on-demand] [--cycle] [--shuffle]')
     if not count_spec:
-        raise UsageError('Usage: tpus launch <prefix> -n <N|A-B> [--zone <zone>] [--type <type>] [--spot|--on-demand] [--cycle]')
+        raise UsageError('Usage: tpus launch <prefix> -n <N|A-B> [--zone <zone>] [--type <type>] [--spot|--on-demand] [--cycle] [--shuffle]')
     config = load_config()
-    failures = []
-    for idx in parse_launch_range(count_spec):
-        name = f'{prefix}-{idx}'
+    indices = parse_launch_range(count_spec)
+
+    def _launch_one(idx: int) -> tuple[str, str | None]:
+        n = f'{prefix}-{idx}'
         try:
-            create_machine(state, config, name, accel_type, zone, mode=mode, cycle=cycle, auto_setup=True, auto_ssh=False)
+            create_machine(state, config, n, accel_type, zone, mode=mode, cycle=cycle, shuffle=shuffle, auto_setup=True, auto_ssh=False)
+            return n, None
         except CommandError as exc:
-            failures.append((name, str(exc)))
+            return n, str(exc)
+
+    failures = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(indices)) as ex:
+        for name, error in ex.map(_launch_one, indices):
+            if error:
+                failures.append((name, error))
     if failures:
         for name, error in failures:
             print(f'{name}: {error}', file=sys.stderr)
@@ -778,38 +933,54 @@ def cmd_rm(args: list[str]) -> None:
                 print('Aborted.')
                 return
         failures = []
-        for machine_name in names:
-            machine = state['machines'][machine_name]
-            result = gcloud('compute', 'tpus', 'tpu-vm', 'delete', machine_name, f"--zone={machine['zone']}", check=False)
-            if result.returncode != 0:
-                failures.append(machine_name)
-                continue
-            remove_machine(state, machine_name)
-            print(f"Removed '{machine_name}'.")
+        snapshot = {n: state['machines'][n] for n in names}
+
+        def _rm_one(machine_name: str) -> tuple[str, bool]:
+            machine = snapshot[machine_name]
+            result = gcloud('compute', 'tpus', 'tpu-vm', 'delete', machine_name, f"--zone={machine['zone']}", '--quiet', check=False)
+            ok = result.returncode == 0 or probe_machine(machine_name, machine['zone']) is None
+            return machine_name, ok
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(names)) as ex:
+            for machine_name, ok in ex.map(_rm_one, names):
+                if ok:
+                    remove_machine(state, machine_name)
+                    print(f"Removed '{machine_name}'.")
+                else:
+                    failures.append(machine_name)
         save_state(state)
         if failures:
             raise CommandError(f'Failed to remove: {", ".join(failures)}')
         return
     if preempted:
-        removed = []
-        for machine_name in sorted(list(state['machines'])):
-            machine = state['machines'][machine_name]
+        machine_names = sorted(state['machines'])
+        snapshot = {n: state['machines'][n] for n in machine_names}
+
+        def _handle_preempted(machine_name: str) -> tuple[str, str | None]:
+            machine = snapshot[machine_name]
             found = []
             if probe:
                 found = probe_machine_across_zones(config, machine_name)
                 probed = found[0][1] if len(found) == 1 else None
             else:
                 probed = probe_machine(machine_name, machine['zone'])
+                if probed:
+                    found = [(machine['zone'], probed)]
             state_text = machine_state_text(probed)
             if not found and not probed:
-                remove_machine(state, machine_name)
-                removed.append(f'{machine_name} (missing)')
-                continue
+                return machine_name, 'missing'
             if state_text.upper() in MISSING_STATES:
-                result = gcloud('compute', 'tpus', 'tpu-vm', 'delete', machine_name, f"--zone={machine['zone']}", check=False)
+                result = gcloud('compute', 'tpus', 'tpu-vm', 'delete', machine_name, f"--zone={machine['zone']}", '--quiet', check=False)
                 if result.returncode == 0 or probe_machine(machine_name, machine['zone']) is None:
+                    return machine_name, state_text
+            return machine_name, None
+
+        removed = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(machine_names) or 1) as ex:
+            for machine_name, action in ex.map(_handle_preempted, machine_names):
+                if action is not None:
                     remove_machine(state, machine_name)
-                    removed.append(f'{machine_name} ({state_text})')
+                    removed.append(f'{machine_name} ({action})')
         save_state(state)
         if removed:
             for entry in removed:
@@ -834,66 +1005,69 @@ def cmd_ls(args: list[str]) -> None:
     state = load_state()
     config = load_config(required=False)
     explicit_probe = '--probe' in args
+    debug = '--debug' in args
     probe = explicit_probe or should_auto_probe(state)
     ready_only = '--ready' in args
     util = '--util' in args
     if '--help' in args:
-        print('Usage: tpus ls [--probe] [--ready] [--util]')
+        print('Usage: tpus ls [--probe] [--ready] [--util] [--debug]')
         return
     if util:
         cmd_util([])
         return
     if ready_only:
-        rows = list_status_rows(state, config, probe=True, include_util=False)
+        rows = list_status_rows(state, config, probe=True, include_util=False, debug=debug, quiet=True)
         for row in rows:
             if row['ready'] == 'yes':
                 print(row['name'])
         return
-    rows = list_status_rows(state, config, probe=probe, include_util=False)
+    rows = list_status_rows(state, config, probe=probe, include_util=False, debug=debug)
     if not rows:
         print('No TPUs tracked.')
         return
-    table = [[row['name'], row['type'], row['mode'], row['zone'], row['state'], row['ready'], row['tracked']] for row in rows]
-    print_table(['NAME', 'TYPE', 'MODE', 'ZONE', 'STATE', 'READY', 'TRACKED'], table)
+    table = [[row['name'], row['type'], row['mode'], row['zone'], fmt_state(row['state']), fmt_ready(row['ready'])] for row in rows]
+    print_table(['NAME', 'TYPE', 'MODE', 'ZONE', 'STATE', 'READY'], table)
 
 
 def cmd_status(args: list[str]) -> None:
     state = load_state()
     config = load_config(required=False)
     include_util = '--util' in args
+    debug = '--debug' in args
     explicit_probe = '--probe' in args or include_util
     probe = explicit_probe or should_auto_probe(state)
     if '--help' in args:
-        print('Usage: tpus status [--probe] [--util]')
+        print('Usage: tpus status [--probe] [--util] [--debug]')
         return
-    rows = list_status_rows(state, config, probe=probe, include_util=include_util)
+    rows = list_status_rows(state, config, probe=probe, include_util=include_util, debug=debug)
     if not rows:
         print('No TPUs tracked.')
         return
     if include_util:
-        table = [[row['name'], row['zone'], row.get('accel', row['type']), row['state'], row['ready'], row.get('tpu', '?'), row.get('hbm', '?'), row['tracked'], row['note']] for row in rows]
-        print_table(['NAME', 'ZONE', 'ACCEL', 'STATE', 'READY', 'TPU', 'HBM', 'TRACKED', 'NOTE'], table)
+        table = [[row['name'], row['zone'], row.get('accel', row['type']), fmt_state(row['state']), fmt_ready(row['ready']), row.get('tpu', '?'), row['note']] for row in rows]
+        print_table(['NAME', 'ZONE', 'ACCEL', 'STATE', 'READY', 'UTIL', 'NOTE'], table)
     else:
-        table = [[row['name'], row['type'], row['mode'], row['zone'], row['state'], row['ready'], row['tracked'], row['note']] for row in rows]
-        print_table(['NAME', 'TYPE', 'MODE', 'ZONE', 'STATE', 'READY', 'TRACKED', 'NOTE'], table)
+        table = [[row['name'], row['type'], row['mode'], row['zone'], fmt_state(row['state']), fmt_ready(row['ready']), row['note']] for row in rows]
+        print_table(['NAME', 'TYPE', 'MODE', 'ZONE', 'STATE', 'READY', 'NOTE'], table)
 
 
 def cmd_util(args: list[str]) -> None:
     if '--help' in args:
-        print('Usage: tpus util [name]')
+        print('Usage: tpus util [name] [--debug]')
         return
     state = load_state()
     config = load_config(required=False)
-    filtered_args = [arg for arg in args if arg != '--help']
+    debug = '--debug' in args
+    filtered_args = [arg for arg in args if arg not in {'--help', '--debug'}]
     target = filtered_args[0] if filtered_args else None
-    rows = list_status_rows(state, config, probe=True if should_auto_probe(state) else False, include_util=True)
+    rows = list_status_rows(state, config, probe=True, include_util=True, debug=debug)
     if target:
         rows = [row for row in rows if row['name'] == target]
     if not rows:
         print('No matching TPUs tracked.')
         return
-    table = [[row['name'], row['zone'], row.get('accel', row['type']), row['state'], row['ready'], row.get('tpu', '?'), row.get('hbm', '?'), row['tracked'], row['note']] for row in rows]
-    print_table(['NAME', 'ZONE', 'ACCEL', 'STATE', 'READY', 'TPU', 'HBM', 'TRACKED', 'NOTE'], table)
+    table = [[row['name'], row['zone'], row.get('accel', row['type']), fmt_state(row['state']), fmt_ready(row['ready']), row.get('tpu', '?'), row['note']] for row in rows]
+    print_table(['NAME', 'ZONE', 'ACCEL', 'STATE', 'READY', 'UTIL', 'NOTE'], table)
 
 
 def cmd_note(args: list[str]) -> None:
@@ -998,6 +1172,20 @@ def cmd_wipe(args: list[str]) -> None:
 
 
 def main(argv: list[str]) -> int:
+    global _COLOR_MODE, RESET, BOLD, DIM, GREEN, YELLOW, RED
+    try:
+        argv, _COLOR_MODE = parse_global_args(argv)
+    except UsageError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    RESET  = _c(0)
+    BOLD   = _c(1)
+    DIM    = _c(2)
+    GREEN  = _c(32)
+    YELLOW = _c(33)
+    RED    = _c(31)
+
     if not argv or argv[0] in {'help', '--help', '-h'}:
         print_help()
         return 0
