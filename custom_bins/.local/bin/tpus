@@ -548,13 +548,56 @@ def create_machine(state: dict, config: dict, name: str, accel_type: str | None,
     raise CommandError(f"All candidate zones failed for '{name}'.")
 
 
+def fzf_select_slot(config: dict) -> tuple[str, str, str]:
+    """Present fzf to pick a grant slot. Returns (full_type, zone, mode)."""
+    defaults = config.get('defaults', {})
+    default_mode = defaults.get('mode', 'spot')
+    slots = []
+    for slot in config.get('grant_slots', []):
+        generation = slot.get('generation') or derive_generation(slot.get('type', ''))
+        zone = slot.get('zone')
+        mode = slot.get('mode', default_mode)
+        max_chips = slot.get('max_chips') or slot.get('chips')
+        if not generation or not zone or max_chips is None:
+            continue
+        slots.append((f'{generation}-{max_chips}', zone, mode))
+    if not slots:
+        raise CommandError('No grant_slots configured. Add grant_slots to config or use --default.')
+    # slots entries: (generation, zone, mode, max_chips)
+    entries = [(gen, z, m, str(chips)) for gen, z, m, chips in
+               [(t.rsplit('-', 1)[0], z, m, t.rsplit('-', 1)[1]) for t, z, m in slots]]
+    col1 = max(len(g) for g, *_ in entries)
+    col2 = max(len(z) for _, z, *_ in entries)
+    lines = '\n'.join(f'{g:<{col1}}  {z:<{col2}}  {m:<10}  max:{chips}' for g, z, m, chips in entries)
+    header = f'{"GEN":<{col1}}  {"ZONE":<{col2}}  {"MODE":<10}  MAX'
+    result = subprocess.run(
+        ['fzf', f'--header={header}', '--layout=reverse', '--no-sort', '--prompt=tpu config> '],
+        input=lines,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        raise SystemExit(0)
+    selected = result.stdout.strip()
+    for g, z, m, _ in entries:
+        if selected.startswith(g) and z in selected:
+            return g, z, m
+    # fallback: parse by position
+    gen = selected[:col1].strip()
+    zone = selected[col1 + 2:col1 + 2 + col2].strip()
+    mode = selected[col1 + 2 + col2 + 2:col1 + 2 + col2 + 12].strip()
+    return gen, zone, mode
+
+
 def parse_add_args(args: list[str]):
     zone = None
     accel_type = None
+    size = None
     mode = None
     cycle = False
     shuffle = False
     no_setup = False
+    use_default = False
     suffix = None
     name = None
     i = 0
@@ -565,6 +608,9 @@ def parse_add_args(args: list[str]):
             i += 2
         elif token == '--type':
             accel_type = args[i + 1]
+            i += 2
+        elif token in ('--size', '-s'):
+            size = int(args[i + 1])
             i += 2
         elif token == '--spot':
             mode = 'spot'
@@ -581,6 +627,9 @@ def parse_add_args(args: list[str]):
         elif token == '--no-setup':
             no_setup = True
             i += 1
+        elif token == '--default':
+            use_default = True
+            i += 1
         elif token == '-n':
             suffix = args[i + 1]
             i += 2
@@ -588,15 +637,15 @@ def parse_add_args(args: list[str]):
             print_help('add')
             raise SystemExit(0)
         elif token.startswith('-'):
-            raise UsageError('Usage: tpus add <name> [-n <suffix>] [--zone <zone>] [--type <type>] [--spot|--on-demand] [--cycle] [--shuffle] [--no-setup]')
+            raise UsageError('Usage: tpus add <name> [-n <suffix>] [--zone <zone>] [--type <type>] [-s <size>] [--spot|--on-demand] [--cycle] [--shuffle] [--no-setup] [--default]')
         else:
             if name is not None:
-                raise UsageError('Usage: tpus add <name> [-n <suffix>] [--zone <zone>] [--type <type>] [--spot|--on-demand] [--cycle] [--shuffle] [--no-setup]')
+                raise UsageError('Usage: tpus add <name> [-n <suffix>] [--zone <zone>] [--type <type>] [-s <size>] [--spot|--on-demand] [--cycle] [--shuffle] [--no-setup] [--default]')
             name = token
             i += 1
     if not name:
-        raise UsageError('Usage: tpus add <name> [-n <suffix>] [--zone <zone>] [--type <type>] [--spot|--on-demand] [--cycle] [--shuffle] [--no-setup]')
-    return normalize_tpu_name(parse_name_suffix(name, suffix)), zone, accel_type, mode, cycle, shuffle, no_setup
+        raise UsageError('Usage: tpus add <name> [-n <suffix>] [--zone <zone>] [--type <type>] [-s <size>] [--spot|--on-demand] [--cycle] [--shuffle] [--no-setup] [--default]')
+    return normalize_tpu_name(parse_name_suffix(name, suffix)), zone, accel_type, size, mode, cycle, shuffle, no_setup, use_default
 
 
 def parse_launch_range(spec: str) -> list[int]:
@@ -767,15 +816,15 @@ def setup_machine(state: dict, config: dict, name: str) -> None:
 
 def print_help(subcommand: str | None = None) -> None:
     if subcommand == 'add':
-        print('Usage: tpus add <name> [-n <suffix>] [--zone <zone>] [--type <type>] [--spot|--on-demand] [--cycle] [--no-setup]')
+        print('Usage: tpus add <name> [-n <suffix>] [--zone <zone>] [--type <type>] [--spot|--on-demand] [--cycle] [--no-setup] [--default]')
         return
     if subcommand == 'launch':
         print('Usage: tpus launch <prefix> -n <N|A-B> [--zone <zone>] [--type <type>] [--spot|--on-demand] [--cycle]')
         return
     print(
         'Usage: tpus [--color=auto|always|never] <command> [args]\n\n'
-        '  add <name> [-n <suffix>] [--zone <z>] [--type <t>] [--spot|--on-demand] [--cycle] [--no-setup]\n'
-        '                                   Create a TPU VM and, by default, run setup then ssh.\n'
+        '  add <name> [-n <suffix>] [--zone <z>] [--type <t>] [--spot|--on-demand] [--cycle] [--no-setup] [--default]\n'
+        '                                   Create a TPU VM (fzf config picker by default; --default skips picker).\n'
         '  launch <prefix> -n <N|A-B> [--zone <z>] [--type <t>] [--spot|--on-demand] [--cycle]\n'
         '                                   Batch-create numbered TPUs and auto-run setup.\n'
         '  rm <name> [--zone <z>] | --all [--quiet] | --preempted [--probe]\n'
@@ -818,8 +867,15 @@ def parse_global_args(argv: list[str]) -> tuple[list[str], str]:
 
 def cmd_add(args: list[str]) -> None:
     state = load_state()
-    name, zone, accel_type, mode, cycle, shuffle, no_setup = parse_add_args(args)
+    name, zone, accel_type, size, mode, cycle, shuffle, no_setup, use_default = parse_add_args(args)
     config = load_config()
+    if not use_default:
+        sel_type, sel_zone, sel_mode = fzf_select_slot(config)
+        accel_type = accel_type or sel_type
+        zone = zone or sel_zone
+        mode = mode or sel_mode
+    if size and accel_type and not re.search(r'-\d+$', accel_type):
+        accel_type = f'{accel_type}-{size}'
     create_machine(state, config, name, accel_type, zone, mode=mode, cycle=cycle, shuffle=shuffle, auto_setup=not no_setup, auto_ssh=not no_setup)
 
 
@@ -999,8 +1055,10 @@ def cmd_rm(args: list[str]) -> None:
     if not machine:
         raise CommandError(f"TPU '{name}' not found in local state or configured zones.")
     delete = gcloud('compute', 'tpus', 'tpu-vm', 'delete', name, f"--zone={machine['zone']}", check=False)
-    if delete.returncode != 0 and probe_machine(name, machine['zone']) is not None:
-        raise CommandError(f"Failed to remove '{name}'")
+    if delete.returncode != 0:
+        probed = probe_machine(name, machine['zone'])
+        if probed is not None and (probed.get('state') or '').upper() in READY_STATES:
+            raise CommandError(f"Failed to remove '{name}'")
     remove_machine(state, name)
     save_state(state)
     print(f"Removed '{name}'.")
