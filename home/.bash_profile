@@ -12,6 +12,7 @@ export PATH=$PATH:$GOPATH/bin
 # Package hygiene
 export UV_EXCLUDE_NEWER="7 days"
 export NPM_CONFIG_MIN_RELEASE_AGE=7
+export PIP_REQUIRE_VIRTUALENV=true
 
 # Load the shell dotfiles, and then some:
 # * ~/.path can be used to extend `$PATH`.
