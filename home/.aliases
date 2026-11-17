@@ -42,6 +42,16 @@ joindir() {
   done
 }
 
+# Merge PDFs locally (macOS): pdfjoin out.pdf a.pdf b.pdf ...
+pdfjoin() {
+  if [ $# -lt 3 ]; then
+    echo "usage: pdfjoin out.pdf in1.pdf in2.pdf ..." >&2
+    return 1
+  fi
+  local out="$1"; shift
+  "/System/Library/Automator/Combine PDF Pages.action/Contents/MacOS/join" -o "$out" "$@"
+}
+
 # Recursively delete `.DS_Store` files
 alias clean-ds="find . -type f -name '*.DS_Store' -ls -delete"
 alias todo='rg -n "TODO|FIX"'
