@@ -7,3 +7,7 @@
 
 [core]
 	excludesFile = ~/.gitignore_global
+
+# Machine-specific settings (untracked; missing file is ignored)
+[include]
+	path = ~/.gitconfig.local

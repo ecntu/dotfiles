@@ -5,6 +5,7 @@ export EDITOR='vim'
 export GOPATH=$HOME/go
 
 # Path add exports
+[ -d /opt/homebrew/bin ] && export PATH="/opt/homebrew/bin:$PATH" # Homebrew first, if installed (OpenSSH w/ YubiKey support)
 export PATH="$HOME/bin:$PATH"; # Add `~/bin`
 export PATH="$PATH:$HOME/.local/bin" # Add `~/.local/bin/env` (uv)
 export PATH=$PATH:$GOPATH/bin
